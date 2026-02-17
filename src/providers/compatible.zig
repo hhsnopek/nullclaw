@@ -14,11 +14,14 @@ pub const AuthStyle = enum {
     bearer,
     /// `x-api-key: <key>`
     x_api_key,
+    /// Custom header name (set via `custom_header` field on the provider)
+    custom,
 
     pub fn headerName(self: AuthStyle) []const u8 {
         return switch (self) {
             .bearer => "authorization",
             .x_api_key => "x-api-key",
+            .custom => "authorization", // fallback; actual name comes from custom_header field
         };
     }
 };
@@ -33,6 +36,11 @@ pub const OpenAiCompatibleProvider = struct {
     base_url: []const u8,
     api_key: ?[]const u8,
     auth_style: AuthStyle,
+    /// Custom header name when auth_style is .custom (e.g. "X-Custom-Key").
+    custom_header: ?[]const u8 = null,
+    /// When false, do not fall back to /v1/responses on chat completions 404.
+    /// GLM/Zhipu does not support the responses API.
+    supports_responses_fallback: bool = true,
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -47,6 +55,25 @@ pub const OpenAiCompatibleProvider = struct {
             .base_url = trimTrailingSlash(base_url),
             .api_key = api_key,
             .auth_style = auth_style,
+            .allocator = allocator,
+        };
+    }
+
+    /// Same as `init` but skips the /v1/responses fallback on 404.
+    /// Use for providers (e.g. GLM) that only support chat completions.
+    pub fn initNoResponsesFallback(
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        base_url: []const u8,
+        api_key: ?[]const u8,
+        auth_style: AuthStyle,
+    ) OpenAiCompatibleProvider {
+        return .{
+            .name = name,
+            .base_url = trimTrailingSlash(base_url),
+            .api_key = api_key,
+            .auth_style = auth_style,
+            .supports_responses_fallback = false,
             .allocator = allocator,
         };
     }
@@ -66,6 +93,150 @@ pub const OpenAiCompatibleProvider = struct {
             return try allocator.dupe(u8, trimmed);
         }
         return std.fmt.allocPrint(allocator, "{s}/chat/completions", .{trimmed});
+    }
+
+    /// Build the full URL for the responses API.
+    /// Derives from base_url: strips /chat/completions suffix if present,
+    /// otherwise appends /v1/responses or /responses depending on path.
+    pub fn responsesUrl(self: OpenAiCompatibleProvider, allocator: std.mem.Allocator) ![]const u8 {
+        const trimmed = trimTrailingSlash(self.base_url);
+
+        // If already ends with /responses, use as-is
+        if (std.mem.endsWith(u8, trimmed, "/responses")) {
+            return try allocator.dupe(u8, trimmed);
+        }
+
+        // If chat endpoint is explicitly configured, derive sibling responses endpoint
+        if (std.mem.endsWith(u8, trimmed, "/chat/completions")) {
+            const prefix = trimmed[0 .. trimmed.len - "/chat/completions".len];
+            return std.fmt.allocPrint(allocator, "{s}/responses", .{prefix});
+        }
+
+        // If an explicit API path exists (anything beyond just scheme://host),
+        // append /responses directly to avoid duplicate /v1 segments
+        if (hasExplicitApiPath(trimmed)) {
+            return std.fmt.allocPrint(allocator, "{s}/responses", .{trimmed});
+        }
+
+        return std.fmt.allocPrint(allocator, "{s}/v1/responses", .{trimmed});
+    }
+
+    fn hasExplicitApiPath(url: []const u8) bool {
+        // Find the path portion after scheme://host
+        const after_scheme = if (std.mem.indexOf(u8, url, "://")) |idx| url[idx + 3 ..] else return false;
+        const path_start = std.mem.indexOf(u8, after_scheme, "/") orelse return false;
+        const path = after_scheme[path_start..];
+        const trimmed_path = trimTrailingSlash(path);
+        return trimmed_path.len > 0 and !std.mem.eql(u8, trimmed_path, "/");
+    }
+
+    /// Build a Responses API request JSON body.
+    pub fn buildResponsesRequestBody(
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        model: []const u8,
+    ) ![]const u8 {
+        if (system_prompt) |sys| {
+            return std.fmt.allocPrint(allocator,
+                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"instructions":"{s}","stream":false}}
+            , .{ model, message, sys });
+        } else {
+            return std.fmt.allocPrint(allocator,
+                \\{{"model":"{s}","input":[{{"role":"user","content":"{s}"}}],"stream":false}}
+            , .{ model, message });
+        }
+    }
+
+    /// Extract text from a Responses API JSON response.
+    /// Checks output_text first, then output[*].content[*] with type "output_text",
+    /// then any text in output[*].content[*].
+    pub fn extractResponsesText(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const root_obj = parsed.value.object;
+
+        // Check top-level output_text first
+        if (root_obj.get("output_text")) |ot| {
+            if (ot == .string) {
+                const trimmed = std.mem.trim(u8, ot.string, " \t\n\r");
+                if (trimmed.len > 0) {
+                    return try allocator.dupe(u8, trimmed);
+                }
+            }
+        }
+
+        // Walk output[*].content[*] looking for type "output_text"
+        if (root_obj.get("output")) |output_arr| {
+            for (output_arr.array.items) |item| {
+                if (item.object.get("content")) |content_arr| {
+                    for (content_arr.array.items) |content| {
+                        const cobj = content.object;
+                        if (cobj.get("type")) |t| {
+                            if (t == .string and std.mem.eql(u8, t.string, "output_text")) {
+                                if (cobj.get("text")) |text| {
+                                    if (text == .string) {
+                                        const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
+                                        if (trimmed.len > 0) {
+                                            return try allocator.dupe(u8, trimmed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: any text in output[*].content[*]
+        if (root_obj.get("output")) |output_arr| {
+            for (output_arr.array.items) |item| {
+                if (item.object.get("content")) |content_arr| {
+                    for (content_arr.array.items) |content| {
+                        if (content.object.get("text")) |text| {
+                            if (text == .string) {
+                                const trimmed = std.mem.trim(u8, text.string, " \t\n\r");
+                                if (trimmed.len > 0) {
+                                    return try allocator.dupe(u8, trimmed);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return error.NoResponseContent;
+    }
+
+    /// Chat via the Responses API endpoint (fallback when chat completions returns 404).
+    pub fn chatViaResponses(
+        self: OpenAiCompatibleProvider,
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        model: []const u8,
+    ) ![]const u8 {
+        const url = try self.responsesUrl(allocator);
+        defer allocator.free(url);
+
+        const body = try buildResponsesRequestBody(allocator, system_prompt, message, model);
+        defer allocator.free(body);
+
+        const auth = try self.authHeaderValue(allocator);
+        defer if (auth) |a| {
+            if (a.needs_free) allocator.free(a.value);
+        };
+
+        const resp_body = if (auth) |a| blk: {
+            var auth_hdr_buf: [512]u8 = undefined;
+            const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
+            break :blk curlPost(allocator, url, body, auth_hdr) catch return error.CompatibleApiError;
+        } else curlPostNoAuth(allocator, url, body) catch return error.CompatibleApiError;
+        defer allocator.free(resp_body);
+
+        return extractResponsesText(allocator, resp_body);
     }
 
     /// Build a chat request JSON body.
@@ -98,6 +269,11 @@ pub const OpenAiCompatibleProvider = struct {
             },
             .x_api_key => .{
                 .name = "x-api-key",
+                .value = key,
+                .needs_free = false,
+            },
+            .custom => .{
+                .name = self.custom_header orelse "authorization",
                 .value = key,
                 .needs_free = false,
             },
@@ -243,7 +419,15 @@ pub const OpenAiCompatibleProvider = struct {
         } else curlPostNoAuth(allocator, url, body) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return parseTextResponse(allocator, resp_body);
+        return parseTextResponse(allocator, resp_body) catch |err| {
+            // If chat completions failed and responses fallback is enabled, try the responses API
+            if (self.supports_responses_fallback) {
+                return self.chatViaResponses(allocator, system_prompt, message, model) catch {
+                    return err;
+                };
+            }
+            return err;
+        };
     }
 
     fn chatImpl(
@@ -545,4 +729,174 @@ test "supportsNativeTools returns true for compatible" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Responses API tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "responsesUrl standard base" {
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com", null, .bearer);
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/responses", url);
+}
+
+test "responsesUrl with v1 no duplicate" {
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1", null, .bearer);
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/responses", url);
+}
+
+test "responsesUrl derives from chat endpoint" {
+    const p = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "custom",
+        "https://my-api.example.com/api/v2/chat/completions",
+        null,
+        .bearer,
+    );
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://my-api.example.com/api/v2/responses", url);
+}
+
+test "responsesUrl custom full endpoint preserved" {
+    const p = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "custom",
+        "https://my-api.example.com/api/v2/responses",
+        null,
+        .bearer,
+    );
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://my-api.example.com/api/v2/responses", url);
+}
+
+test "responsesUrl non-v1 api path uses raw suffix" {
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/api/coding/v3", null, .bearer);
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://api.example.com/api/coding/v3/responses", url);
+}
+
+test "responsesUrl requires exact suffix match" {
+    const p = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "custom",
+        "https://my-api.example.com/api/v2/responses-proxy",
+        null,
+        .bearer,
+    );
+    const url = try p.responsesUrl(std.testing.allocator);
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("https://my-api.example.com/api/v2/responses-proxy/responses", url);
+}
+
+test "extractResponsesText top-level output_text" {
+    const body =
+        \\{"output_text":"Hello from top-level","output":[]}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from top-level", result);
+}
+
+test "extractResponsesText nested output_text type" {
+    const body =
+        \\{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from nested", result);
+}
+
+test "extractResponsesText fallback any text" {
+    const body =
+        \\{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}
+    ;
+    const result = try OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Fallback text", result);
+}
+
+test "extractResponsesText empty returns error" {
+    const body =
+        \\{"output":[]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.extractResponsesText(std.testing.allocator, body));
+}
+
+test "buildResponsesRequestBody with system" {
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        "You are helpful",
+        "hello",
+        "gpt-4o",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "instructions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "You are helpful") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "buildResponsesRequestBody without system" {
+    const body = try OpenAiCompatibleProvider.buildResponsesRequestBody(
+        std.testing.allocator,
+        null,
+        "hello",
+        "gpt-4o",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "instructions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
+}
+
+test "initNoResponsesFallback sets field to false" {
+    const p = OpenAiCompatibleProvider.initNoResponsesFallback(
+        std.testing.allocator,
+        "GLM",
+        "https://open.bigmodel.cn/api/paas/v4",
+        "key",
+        .bearer,
+    );
+    try std.testing.expect(!p.supports_responses_fallback);
+    try std.testing.expectEqualStrings("GLM", p.name);
+}
+
+test "init defaults supports_responses_fallback to true" {
+    const p = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://example.com",
+        null,
+        .bearer,
+    );
+    try std.testing.expect(p.supports_responses_fallback);
+}
+
+test "AuthStyle custom headerName fallback" {
+    try std.testing.expectEqualStrings("authorization", AuthStyle.custom.headerName());
+}
+
+test "authHeaderValue custom style" {
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom);
+    p.custom_header = "X-Custom-Key";
+    const auth = (try p.authHeaderValue(std.testing.allocator)).?;
+    defer if (auth.needs_free) std.testing.allocator.free(auth.value);
+    try std.testing.expectEqualStrings("X-Custom-Key", auth.name);
+    try std.testing.expectEqualStrings("my-key", auth.value);
+    try std.testing.expect(!auth.needs_free);
+}
+
+test "authHeaderValue custom style without custom_header falls back" {
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom);
+    const auth = (try p.authHeaderValue(std.testing.allocator)).?;
+    defer if (auth.needs_free) std.testing.allocator.free(auth.value);
+    try std.testing.expectEqualStrings("authorization", auth.name);
+    try std.testing.expectEqualStrings("my-key", auth.value);
 }

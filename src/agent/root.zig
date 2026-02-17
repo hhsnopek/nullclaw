@@ -266,10 +266,15 @@ pub const Agent = struct {
             self.has_system_prompt = true;
         }
 
-        // Auto-save user message to memory
+        // Auto-save user message to memory (timestamp-based key to avoid overwriting)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                mem.store("user_msg", user_message, .conversation) catch {};
+                const ts = @as(u64, @intCast(std.time.timestamp()));
+                const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
+                if (save_key) |key| {
+                    defer self.allocator.free(key);
+                    mem.store(key, user_message, .conversation) catch {};
+                }
             }
         }
 
@@ -326,7 +331,7 @@ pub const Agent = struct {
                 self.observer.recordEvent(&fail_event);
 
                 // Retry once
-                std.time.sleep(500 * std.time.ns_per_ms);
+                std.Thread.sleep(500 * std.time.ns_per_ms);
                 break :retry_blk self.provider.chat(
                     self.allocator,
                     .{
@@ -355,25 +360,74 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
 
-            // Parse tool calls from response
             const response_text = response.contentOrEmpty();
+            const use_native = response.hasToolCalls();
 
-            const parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
+            // Determine tool calls: structured (native) first, then XML fallback.
+            // Mirrors ZeroClaw's run_tool_call_loop logic.
+            var parsed_calls: []ParsedToolCall = &.{};
+            var parsed_text: []const u8 = "";
+            var assistant_history_content: []const u8 = "";
+
+            // Track what we need to free
+            var free_parsed_calls = false;
+            var free_parsed_text = false;
+            var free_assistant_history = false;
+
             defer {
-                if (parsed.text.len > 0) self.allocator.free(parsed.text);
-                for (parsed.calls) |call| {
-                    self.allocator.free(call.name);
-                    self.allocator.free(call.arguments_json);
+                if (free_parsed_calls) {
+                    for (parsed_calls) |call| {
+                        self.allocator.free(call.name);
+                        self.allocator.free(call.arguments_json);
+                        if (call.tool_call_id) |id| self.allocator.free(id);
+                    }
+                    self.allocator.free(parsed_calls);
                 }
-                self.allocator.free(parsed.calls);
+                if (free_parsed_text and parsed_text.len > 0) self.allocator.free(parsed_text);
+                if (free_assistant_history and assistant_history_content.len > 0) self.allocator.free(assistant_history_content);
             }
 
-            if (parsed.calls.len == 0) {
+            if (use_native) {
+                // Provider returned structured tool_calls — convert them
+                parsed_calls = try dispatcher.parseStructuredToolCalls(self.allocator, response.tool_calls);
+                free_parsed_calls = true;
+
+                if (parsed_calls.len == 0) {
+                    // Structured calls were empty (e.g. all had empty names) — try XML fallback
+                    self.allocator.free(parsed_calls);
+                    free_parsed_calls = false;
+
+                    const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
+                    parsed_calls = xml_parsed.calls;
+                    free_parsed_calls = true;
+                    parsed_text = xml_parsed.text;
+                    free_parsed_text = true;
+                }
+
+                // Build history content with serialized tool calls
+                assistant_history_content = try buildAssistantHistoryWithToolCalls(
+                    self.allocator,
+                    response_text,
+                    parsed_calls,
+                );
+                free_assistant_history = true;
+            } else {
+                // No native tool calls — parse response text for XML tool calls
+                const xml_parsed = try dispatcher.parseToolCalls(self.allocator, response_text);
+                parsed_calls = xml_parsed.calls;
+                free_parsed_calls = true;
+                parsed_text = xml_parsed.text;
+                free_parsed_text = true;
+                // For XML path, store the raw response text as history
+                assistant_history_content = response_text;
+            }
+
+            // Determine display text
+            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+
+            if (parsed_calls.len == 0) {
                 // No tool calls — final response
-                const final_text = if (parsed.text.len > 0)
-                    try self.allocator.dupe(u8, parsed.text)
-                else
-                    try self.allocator.dupe(u8, response_text);
+                const final_text = try self.allocator.dupe(u8, display_text);
 
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
@@ -388,7 +442,10 @@ pub const Agent = struct {
                 if (self.auto_save) {
                     if (self.mem) |mem| {
                         const summary = if (final_text.len > 100) final_text[0..100] else final_text;
-                        mem.store("assistant_resp", summary, .daily) catch {};
+                        const ts = @as(u64, @intCast(std.time.timestamp()));
+                        const save_key = try std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts});
+                        defer self.allocator.free(save_key);
+                        mem.store(save_key, summary, .daily) catch {};
                     }
                 }
 
@@ -398,27 +455,26 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — add assistant's response to history
-            if (parsed.text.len > 0) {
-                // Print intermediary text to stdout
+            // There are tool calls — print intermediary text
+            if (display_text.len > 0 and parsed_calls.len > 0) {
                 var out_buf: [4096]u8 = undefined;
                 var bw = std.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
-                w.print("{s}", .{parsed.text}) catch {};
+                w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
             }
 
             // Record assistant message with tool calls in history
             try self.history.append(self.allocator, .{
                 .role = .assistant,
-                .content = try self.allocator.dupe(u8, response_text),
+                .content = try self.allocator.dupe(u8, assistant_history_content),
             });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
 
-            for (parsed.calls) |call| {
+            for (parsed_calls) |call| {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
@@ -476,6 +532,39 @@ pub const Agent = struct {
             .success = false,
             .tool_call_id = call.tool_call_id,
         };
+    }
+
+    /// Build an assistant history entry that includes serialized tool calls as XML.
+    ///
+    /// When the provider returns structured tool_calls, we serialize them as
+    /// `<tool_call>` XML tags so the conversation history stays in a canonical
+    /// format regardless of whether tools came from native API or XML parsing.
+    ///
+    /// Mirrors ZeroClaw's `build_assistant_history_with_tool_calls`.
+    pub fn buildAssistantHistoryWithToolCalls(
+        allocator: std.mem.Allocator,
+        response_text: []const u8,
+        parsed_calls: []const ParsedToolCall,
+    ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+
+        if (response_text.len > 0) {
+            try w.writeAll(response_text);
+            try w.writeByte('\n');
+        }
+
+        for (parsed_calls) |call| {
+            try w.writeAll("<tool_call>\n");
+            try std.fmt.format(w, "{{\"name\": \"{s}\", \"arguments\": {s}}}", .{
+                call.name,
+                call.arguments_json,
+            });
+            try w.writeAll("\n</tool_call>\n");
+        }
+
+        return buf.toOwnedSlice(allocator);
     }
 
     /// Build a flat ChatMessage slice from owned history.
@@ -1115,4 +1204,170 @@ test "Agent clearHistory then add messages" {
     });
     try std.testing.expectEqual(@as(usize, 1), agent.historyLen());
     try std.testing.expectEqualStrings("new", agent.history.items[0].content);
+}
+
+// ── buildAssistantHistoryWithToolCalls tests ─────────────────────
+
+test "buildAssistantHistoryWithToolCalls with text and calls" {
+    const allocator = std.testing.allocator;
+    const calls = [_]ParsedToolCall{
+        .{ .name = "shell", .arguments_json = "{\"command\":\"ls\"}" },
+        .{ .name = "file_read", .arguments_json = "{\"path\":\"a.txt\"}" },
+    };
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "Let me check that.",
+        &calls,
+    );
+    defer allocator.free(result);
+
+    // Should contain the response text
+    try std.testing.expect(std.mem.indexOf(u8, result, "Let me check that.") != null);
+    // Should contain tool_call XML tags
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "</tool_call>") != null);
+    // Should contain tool names
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"file_read\"") != null);
+    // Should contain two tool_call tags
+    var count: usize = 0;
+    var search = result;
+    while (std.mem.indexOf(u8, search, "<tool_call>")) |idx| {
+        count += 1;
+        search = search[idx + 11 ..];
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "buildAssistantHistoryWithToolCalls empty text" {
+    const allocator = std.testing.allocator;
+    const calls = [_]ParsedToolCall{
+        .{ .name = "shell", .arguments_json = "{}" },
+    };
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "",
+        &calls,
+    );
+    defer allocator.free(result);
+
+    // Should NOT start with a newline (no empty text prefix)
+    try std.testing.expect(result[0] == '<');
+    try std.testing.expect(std.mem.indexOf(u8, result, "<tool_call>") != null);
+}
+
+test "buildAssistantHistoryWithToolCalls no calls" {
+    const allocator = std.testing.allocator;
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "Just text, no tools.",
+        &.{},
+    );
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Just text, no tools.\n", result);
+}
+
+test "buildAssistantHistoryWithToolCalls empty text and no calls" {
+    const allocator = std.testing.allocator;
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "",
+        &.{},
+    );
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "buildAssistantHistoryWithToolCalls preserves arguments JSON" {
+    const allocator = std.testing.allocator;
+    const calls = [_]ParsedToolCall{
+        .{ .name = "file_write", .arguments_json = "{\"path\":\"test.py\",\"content\":\"print('hello')\"}" },
+    };
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "",
+        &calls,
+    );
+    defer allocator.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"file_write\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "print('hello')") != null);
+}
+
+// ── parseStructuredToolCalls tests ──────────────────────────────
+
+test "parseStructuredToolCalls converts ToolCalls to ParsedToolCalls" {
+    const allocator = std.testing.allocator;
+    const tool_calls = [_]providers.ToolCall{
+        .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
+        .{ .id = "call_2", .name = "file_read", .arguments = "{\"path\":\"a.txt\"}" },
+    };
+
+    const result = try dispatcher.parseStructuredToolCalls(allocator, &tool_calls);
+    defer {
+        for (result) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", result[0].arguments_json);
+    try std.testing.expectEqualStrings("call_1", result[0].tool_call_id.?);
+    try std.testing.expectEqualStrings("file_read", result[1].name);
+    try std.testing.expectEqualStrings("call_2", result[1].tool_call_id.?);
+}
+
+test "parseStructuredToolCalls skips empty names" {
+    const allocator = std.testing.allocator;
+    const tool_calls = [_]providers.ToolCall{
+        .{ .id = "tc1", .name = "", .arguments = "{}" },
+        .{ .id = "tc2", .name = "shell", .arguments = "{}" },
+    };
+
+    const result = try dispatcher.parseStructuredToolCalls(allocator, &tool_calls);
+    defer {
+        for (result) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name);
+}
+
+test "parseStructuredToolCalls empty input" {
+    const allocator = std.testing.allocator;
+    const result = try dispatcher.parseStructuredToolCalls(allocator, &.{});
+    defer allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parseStructuredToolCalls empty id yields null tool_call_id" {
+    const allocator = std.testing.allocator;
+    const tool_calls = [_]providers.ToolCall{
+        .{ .id = "", .name = "shell", .arguments = "{}" },
+    };
+
+    const result = try dispatcher.parseStructuredToolCalls(allocator, &tool_calls);
+    defer {
+        for (result) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+            if (call.tool_call_id) |id| allocator.free(id);
+        }
+        allocator.free(result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expect(result[0].tool_call_id == null);
 }

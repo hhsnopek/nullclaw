@@ -68,6 +68,7 @@ pub const ReliabilityConfig = struct {
     channel_max_backoff_secs: u64 = 60,
     scheduler_poll_secs: u64 = 15,
     scheduler_retries: u32 = 2,
+    fallback_providers: []const []const u8 = &.{},
 };
 
 pub const SchedulerConfig = struct {
@@ -1192,7 +1193,7 @@ pub const Config = struct {
         try w.print("  }}\n", .{});
 
         try w.print("}}\n", .{});
-        try bw.flush();
+        try w.flush();
     }
 
     pub fn ensureDirs(self: *const Config) !void {

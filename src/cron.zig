@@ -403,7 +403,7 @@ pub const CronScheduler = struct {
                     self.allocator.free(result.stderr);
 
                     job.last_run_secs = now;
-                    job.last_status = if (result.term.code == 0) "ok" else "error";
+                    job.last_status = if (result.term == .Exited and result.term.Exited == 0) "ok" else "error";
 
                     if (job.one_shot) {
                         // Mark for removal (set next_run far in the future; actual removal in next sweep)
@@ -415,7 +415,7 @@ pub const CronScheduler = struct {
                 }
             }
 
-            std.time.sleep(poll_ns);
+            std.Thread.sleep(poll_ns);
         }
     }
 };

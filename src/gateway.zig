@@ -414,8 +414,8 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
         &[_][]const u8{ self_path, "agent", "-m", message },
         allocator,
     );
-    child.stdout_behavior = .pipe;
-    child.stderr_behavior = .pipe;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -473,8 +473,8 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
         },
         allocator,
     );
-    curl_child.stdout_behavior = .pipe;
-    curl_child.stderr_behavior = .pipe;
+    curl_child.stdout_behavior = .Pipe;
+    curl_child.stderr_behavior = .Pipe;
 
     curl_child.spawn() catch return;
     _ = curl_child.wait() catch {};

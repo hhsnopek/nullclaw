@@ -6,6 +6,7 @@ const ChatMessage = root.ChatMessage;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const ToolCall = root.ToolCall;
+const ToolSpec = root.ToolSpec;
 const TokenUsage = root.TokenUsage;
 
 /// OpenRouter provider — AI model aggregator.
@@ -138,6 +139,112 @@ pub const OpenRouterProvider = struct {
         return error.NoResponseContent;
     }
 
+    /// Pre-warm TLS connection by hitting auth endpoint. Best-effort, ignores errors.
+    pub fn warmup(self: *OpenRouterProvider) void {
+        const api_key = self.api_key orelse return;
+        const auth_hdr = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{api_key}) catch return;
+        defer self.allocator.free(auth_hdr);
+        const resp = curlGet(self.allocator, WARMUP_URL, auth_hdr) catch return;
+        self.allocator.free(resp);
+    }
+
+    /// Convert ChatMessages to a JSON array string for the API.
+    pub fn convertMessages(allocator: std.mem.Allocator, messages: []const ChatMessage, system: ?[]const u8) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.append(allocator, '[');
+
+        var count: usize = 0;
+
+        // Prepend system message if provided
+        if (system) |sys| {
+            try buf.appendSlice(allocator, "{\"role\":\"system\",\"content\":");
+            try appendJsonString(&buf, allocator, sys);
+            try buf.append(allocator, '}');
+            count += 1;
+        }
+
+        for (messages) |msg| {
+            if (count > 0) try buf.append(allocator, ',');
+            count += 1;
+
+            try buf.appendSlice(allocator, "{\"role\":\"");
+            try buf.appendSlice(allocator, msg.role.toSlice());
+            try buf.appendSlice(allocator, "\",\"content\":");
+            try appendJsonString(&buf, allocator, msg.content);
+
+            if (msg.tool_call_id) |tc_id| {
+                try buf.appendSlice(allocator, ",\"tool_call_id\":\"");
+                try buf.appendSlice(allocator, tc_id);
+                try buf.append(allocator, '"');
+            }
+
+            try buf.append(allocator, '}');
+        }
+
+        try buf.append(allocator, ']');
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    /// Convert ToolSpecs to a JSON array string for native function calling.
+    pub fn convertTools(allocator: std.mem.Allocator, tools: []const ToolSpec) ![]const u8 {
+        if (tools.len == 0) return try allocator.dupe(u8, "[]");
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.append(allocator, '[');
+
+        for (tools, 0..) |tool, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":\"");
+            try buf.appendSlice(allocator, tool.name);
+            try buf.appendSlice(allocator, "\",\"description\":\"");
+            try buf.appendSlice(allocator, tool.description);
+            try buf.appendSlice(allocator, "\",\"parameters\":");
+            try buf.appendSlice(allocator, tool.parameters_json);
+            try buf.appendSlice(allocator, "}}");
+        }
+
+        try buf.append(allocator, ']');
+        return try buf.toOwnedSlice(allocator);
+    }
+
+    /// Multi-turn chat with history. Sends all messages to the API.
+    pub fn chatWithHistory(
+        self: *OpenRouterProvider,
+        allocator: std.mem.Allocator,
+        messages: []const ChatMessage,
+        system: ?[]const u8,
+        model: []const u8,
+        temperature: f64,
+    ) ![]const u8 {
+        const api_key = self.api_key orelse return error.CredentialsNotSet;
+
+        const msgs_json = try convertMessages(allocator, messages, system);
+        defer allocator.free(msgs_json);
+
+        const body = try std.fmt.allocPrint(allocator,
+            \\{{"model":"{s}","messages":{s},"temperature":{d:.2}}}
+        , .{ model, msgs_json, temperature });
+        defer allocator.free(body);
+
+        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
+        defer allocator.free(auth_hdr);
+
+        const referer_hdr = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{REFERER});
+        defer allocator.free(referer_hdr);
+
+        const title_hdr = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{TITLE});
+        defer allocator.free(title_hdr);
+
+        const resp_body = curlPost(allocator, BASE_URL, body, auth_hdr, referer_hdr, title_hdr) catch return error.OpenRouterApiError;
+        defer allocator.free(resp_body);
+
+        return parseTextResponse(allocator, resp_body);
+    }
+
     /// Create a Provider interface from this OpenRouterProvider.
     pub fn provider(self: *OpenRouterProvider) Provider {
         return .{
@@ -152,7 +259,13 @@ pub const OpenRouterProvider = struct {
         .supportsNativeTools = supportsNativeToolsImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
+        .warmup = warmupImpl,
     };
+
+    fn warmupImpl(ptr: *anyopaque) void {
+        const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
+        self.warmup();
+    }
 
     fn chatWithSystemImpl(
         ptr: *anyopaque,
@@ -286,6 +399,51 @@ fn curlPost(allocator: std.mem.Allocator, url: []const u8, body: []const u8, aut
     return stdout;
 }
 
+/// HTTP GET via curl subprocess with auth header.
+fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
+    var child = std.process.Child.init(&.{
+        "curl", "-s", "-H", auth_hdr, url,
+    }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+
+    try child.spawn();
+
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+
+    const term = child.wait() catch return error.CurlWaitError;
+    if (term != .Exited or term.Exited != 0) {
+        allocator.free(stdout);
+        return error.CurlFailed;
+    }
+
+    return stdout;
+}
+
+/// Append a JSON-escaped string (with quotes) to the buffer.
+fn appendJsonString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    var escape_buf: [6]u8 = undefined;
+                    const escape = std.fmt.bufPrint(&escape_buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try buf.appendSlice(allocator, escape);
+                } else {
+                    try buf.append(allocator, c);
+                }
+            },
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -334,4 +492,142 @@ test "supportsNativeTools returns true" {
     var p = OpenRouterProvider.init(std.testing.allocator, "key");
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
+}
+
+test "convertMessages produces valid JSON with system, user, assistant" {
+    const alloc = std.testing.allocator;
+    const messages = &[_]ChatMessage{
+        ChatMessage.user("Hello"),
+        ChatMessage.assistant("Hi there"),
+        ChatMessage.user("Follow up"),
+    };
+    const result = try OpenRouterProvider.convertMessages(alloc, messages, "Be concise");
+    defer alloc.free(result);
+
+    // Verify it's valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+
+    // system + 3 messages = 4
+    try std.testing.expectEqual(@as(usize, 4), arr.items.len);
+    try std.testing.expectEqualStrings("system", arr.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("Be concise", arr.items[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", arr.items[1].object.get("role").?.string);
+    try std.testing.expectEqualStrings("assistant", arr.items[2].object.get("role").?.string);
+    try std.testing.expectEqualStrings("user", arr.items[3].object.get("role").?.string);
+}
+
+test "convertMessages with tool role includes tool_call_id" {
+    const alloc = std.testing.allocator;
+    const messages = &[_]ChatMessage{
+        ChatMessage.toolMsg("done", "call_xyz"),
+    };
+    const result = try OpenRouterProvider.convertMessages(alloc, messages, null);
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    try std.testing.expectEqualStrings("tool", arr.items[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("call_xyz", arr.items[0].object.get("tool_call_id").?.string);
+    try std.testing.expectEqualStrings("done", arr.items[0].object.get("content").?.string);
+}
+
+test "convertMessages without system prompt" {
+    const alloc = std.testing.allocator;
+    const messages = &[_]ChatMessage{
+        ChatMessage.user("Hello"),
+    };
+    const result = try OpenRouterProvider.convertMessages(alloc, messages, null);
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    try std.testing.expectEqualStrings("user", arr.items[0].object.get("role").?.string);
+}
+
+test "convertMessages escapes special characters" {
+    const alloc = std.testing.allocator;
+    const messages = &[_]ChatMessage{
+        ChatMessage.user("line1\nline2\ttab\"quote"),
+    };
+    const result = try OpenRouterProvider.convertMessages(alloc, messages, null);
+    defer alloc.free(result);
+
+    // Must parse as valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+
+    try std.testing.expectEqualStrings("line1\nline2\ttab\"quote", arr.items[0].object.get("content").?.string);
+}
+
+test "convertTools produces valid JSON schema" {
+    const alloc = std.testing.allocator;
+    const tools = &[_]ToolSpec{
+        .{
+            .name = "shell",
+            .description = "Run a shell command",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}}}",
+        },
+        .{
+            .name = "file_read",
+            .description = "Read a file",
+            .parameters_json = "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}",
+        },
+    };
+    const result = try OpenRouterProvider.convertTools(alloc, tools);
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+
+    // First tool
+    const t0 = arr.items[0].object;
+    try std.testing.expectEqualStrings("function", t0.get("type").?.string);
+    const f0 = t0.get("function").?.object;
+    try std.testing.expectEqualStrings("shell", f0.get("name").?.string);
+    try std.testing.expectEqualStrings("Run a shell command", f0.get("description").?.string);
+    try std.testing.expect(f0.get("parameters").? == .object);
+
+    // Second tool
+    const t1 = arr.items[1].object;
+    const f1 = t1.get("function").?.object;
+    try std.testing.expectEqualStrings("file_read", f1.get("name").?.string);
+}
+
+test "convertTools with empty tools returns empty array" {
+    const alloc = std.testing.allocator;
+    const result = try OpenRouterProvider.convertTools(alloc, &.{});
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "warmup does not crash without key" {
+    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    p.warmup(); // Should return immediately, no crash
+}
+
+test "warmup does not crash via vtable" {
+    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    const prov = p.provider();
+    prov.warmup(); // Should call warmupImpl -> warmup, no crash
+}
+
+test "chatWithHistory fails without key" {
+    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    const messages = &[_]ChatMessage{
+        ChatMessage.user("hello"),
+    };
+    const result = p.chatWithHistory(std.testing.allocator, messages, null, "openai/gpt-4o", 0.7);
+    try std.testing.expectError(error.CredentialsNotSet, result);
 }

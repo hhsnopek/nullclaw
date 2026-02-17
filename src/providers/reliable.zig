@@ -98,14 +98,31 @@ pub fn parseRetryAfterMs(err_msg: []const u8) ?u64 {
     return null;
 }
 
-/// Provider wrapper with retry and provider fallback behavior.
+/// A named provider entry for the fallback chain.
+pub const ProviderEntry = struct {
+    name: []const u8,
+    provider: Provider,
+};
+
+/// A model fallback mapping: when `model` fails, try `fallbacks` in order.
+pub const ModelFallbackEntry = struct {
+    model: []const u8,
+    fallbacks: []const []const u8,
+};
+
+/// Provider wrapper with retry, multi-provider fallback, and model failover.
 ///
-/// Wraps an inner provider and retries on transient errors with exponential
-/// backoff. Skips retries for non-retryable client errors (4xx except 429/408).
-/// On rate-limit errors, rotates API keys if available.
+/// Wraps a primary inner provider and optional extra providers as a fallback chain.
+/// Retries on transient errors with exponential backoff. Skips retries for
+/// non-retryable client errors (4xx except 429/408). On rate-limit errors,
+/// rotates API keys if available. Supports per-model fallback chains.
 pub const ReliableProvider = struct {
-    /// The wrapped inner provider to delegate calls to.
+    /// The wrapped primary inner provider to delegate calls to.
     inner: Provider,
+    /// Additional fallback providers (empty by default for backward compat).
+    extras: []const ProviderEntry = &.{},
+    /// Per-model fallback chains.
+    model_fallbacks: []const ModelFallbackEntry = &.{},
     /// List of provider names (for diagnostics/logging).
     provider_names: []const []const u8,
     max_retries: u32,
@@ -163,6 +180,42 @@ pub const ReliableProvider = struct {
         return self;
     }
 
+    /// Set additional fallback providers.
+    pub fn withExtras(self: ReliableProvider, extras: []const ProviderEntry) ReliableProvider {
+        var r = self;
+        r.extras = extras;
+        return r;
+    }
+
+    /// Set per-model fallback chains.
+    pub fn withModelFallbacks(self: ReliableProvider, fallbacks: []const ModelFallbackEntry) ReliableProvider {
+        var r = self;
+        r.model_fallbacks = fallbacks;
+        return r;
+    }
+
+    /// Returns the model chain for a given model: [model, fallback1, fallback2, ...].
+    /// If no fallbacks configured for this model, returns a single-element slice.
+    /// Caller must free the returned slice.
+    pub fn modelChain(self: *const ReliableProvider, allocator: std.mem.Allocator, model: []const u8) ![]const []const u8 {
+        // Find fallbacks for this model
+        for (self.model_fallbacks) |entry| {
+            if (std.mem.eql(u8, entry.model, model)) {
+                // Build chain: [model] ++ fallbacks
+                const chain = try allocator.alloc([]const u8, 1 + entry.fallbacks.len);
+                chain[0] = model;
+                for (entry.fallbacks, 0..) |fb, i| {
+                    chain[1 + i] = fb;
+                }
+                return chain;
+            }
+        }
+        // No fallbacks: single-element slice
+        const chain = try allocator.alloc([]const u8, 1);
+        chain[0] = model;
+        return chain;
+    }
+
     /// Advance to the next API key (round-robin) and return it.
     pub fn rotateKey(self: *ReliableProvider) ?[]const u8 {
         if (self.api_keys.len == 0) return null;
@@ -201,6 +254,7 @@ pub const ReliableProvider = struct {
         .supportsNativeTools = supportsNativeToolsImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
+        .warmup = warmupImpl,
     };
 
     /// Create a Provider interface from this ReliableProvider.
@@ -209,6 +263,73 @@ pub const ReliableProvider = struct {
             .ptr = @ptrCast(self),
             .vtable = &vtable_impl,
         };
+    }
+
+    /// Try a single provider with retries for chatWithSystem.
+    fn tryChatWithSystemProvider(
+        self: *ReliableProvider,
+        prov: Provider,
+        allocator: std.mem.Allocator,
+        system_prompt: ?[]const u8,
+        message: []const u8,
+        current_model: []const u8,
+    ) ?[]const u8 {
+        var backoff_ms = self.base_backoff_ms;
+        var attempt: u32 = 0;
+        while (attempt <= self.max_retries) : (attempt += 1) {
+            if (prov.chatWithSystem(allocator, system_prompt, message, current_model, 0.7)) |result| {
+                return result;
+            } else |err| {
+                self.storeErrorName(err);
+                const err_slice = self.lastErrorSlice();
+
+                if (isNonRetryable(err_slice)) break;
+
+                if (isRateLimited(err_slice)) {
+                    _ = self.rotateKey();
+                }
+
+                if (attempt < self.max_retries) {
+                    const wait = self.computeBackoff(backoff_ms, err_slice);
+                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Try a single provider with retries for chat.
+    fn tryChatProvider(
+        self: *ReliableProvider,
+        prov: Provider,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        current_model: []const u8,
+    ) ?ChatResponse {
+        var backoff_ms = self.base_backoff_ms;
+        var attempt: u32 = 0;
+        while (attempt <= self.max_retries) : (attempt += 1) {
+            if (prov.chat(allocator, request, current_model, request.temperature)) |result| {
+                return result;
+            } else |err| {
+                self.storeErrorName(err);
+                const err_slice = self.lastErrorSlice();
+
+                if (isNonRetryable(err_slice)) break;
+
+                if (isRateLimited(err_slice)) {
+                    _ = self.rotateKey();
+                }
+
+                if (attempt < self.max_retries) {
+                    const wait = self.computeBackoff(backoff_ms, err_slice);
+                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+                }
+            }
+        }
+        return null;
     }
 
     fn chatWithSystemImpl(
@@ -220,38 +341,38 @@ pub const ReliableProvider = struct {
         temperature: f64,
     ) anyerror![]const u8 {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        var backoff_ms = self.base_backoff_ms;
-        var last_err: anyerror = error.AllProvidersFailed;
+        _ = temperature;
 
-        var attempt: u32 = 0;
-        while (attempt <= self.max_retries) : (attempt += 1) {
-            if (self.inner.chatWithSystem(allocator, system_prompt, message, model, temperature)) |result| {
+        const models = try self.modelChain(allocator, model);
+        defer allocator.free(models);
+
+        for (models) |current_model| {
+            // Try primary provider
+            if (self.tryChatWithSystemProvider(
+                self.inner,
+                allocator,
+                system_prompt,
+                message,
+                current_model,
+            )) |result| {
                 return result;
-            } else |err| {
-                last_err = err;
-                self.storeErrorName(err);
-                const err_slice = self.lastErrorSlice();
+            }
 
-                // Non-retryable errors: stop immediately
-                if (isNonRetryable(err_slice)) {
-                    return err;
-                }
-
-                // Rate-limited: try rotating API key
-                if (isRateLimited(err_slice)) {
-                    _ = self.rotateKey();
-                }
-
-                // If we have more retries left, sleep with backoff
-                if (attempt < self.max_retries) {
-                    const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
-                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+            // Try extra providers
+            for (self.extras) |entry| {
+                if (self.tryChatWithSystemProvider(
+                    entry.provider,
+                    allocator,
+                    system_prompt,
+                    message,
+                    current_model,
+                )) |result| {
+                    return result;
                 }
             }
         }
 
-        return last_err;
+        return error.AllProvidersFailed;
     }
 
     fn chatImpl(
@@ -262,43 +383,45 @@ pub const ReliableProvider = struct {
         temperature: f64,
     ) anyerror!ChatResponse {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        var backoff_ms = self.base_backoff_ms;
-        var last_err: anyerror = error.AllProvidersFailed;
+        _ = temperature;
 
-        var attempt: u32 = 0;
-        while (attempt <= self.max_retries) : (attempt += 1) {
-            if (self.inner.chat(allocator, request, model, temperature)) |result| {
+        const models = try self.modelChain(allocator, model);
+        defer allocator.free(models);
+
+        for (models) |current_model| {
+            // Try primary provider
+            if (self.tryChatProvider(
+                self.inner,
+                allocator,
+                request,
+                current_model,
+            )) |result| {
                 return result;
-            } else |err| {
-                last_err = err;
-                self.storeErrorName(err);
-                const err_slice = self.lastErrorSlice();
+            }
 
-                // Non-retryable errors: stop immediately
-                if (isNonRetryable(err_slice)) {
-                    return err;
-                }
-
-                // Rate-limited: try rotating API key
-                if (isRateLimited(err_slice)) {
-                    _ = self.rotateKey();
-                }
-
-                // If we have more retries left, sleep with backoff
-                if (attempt < self.max_retries) {
-                    const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
-                    backoff_ms = @min(backoff_ms *| 2, 10_000);
+            // Try extra providers
+            for (self.extras) |entry| {
+                if (self.tryChatProvider(
+                    entry.provider,
+                    allocator,
+                    request,
+                    current_model,
+                )) |result| {
+                    return result;
                 }
             }
         }
 
-        return last_err;
+        return error.AllProvidersFailed;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
-        return self.inner.supportsNativeTools();
+        if (self.inner.supportsNativeTools()) return true;
+        for (self.extras) |entry| {
+            if (entry.provider.supportsNativeTools()) return true;
+        }
+        return false;
     }
 
     fn getNameImpl(ptr: *anyopaque) []const u8 {
@@ -309,6 +432,17 @@ pub const ReliableProvider = struct {
     fn deinitImpl(ptr: *anyopaque) void {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         self.inner.deinit();
+        for (self.extras) |entry| {
+            entry.provider.deinit();
+        }
+    }
+
+    fn warmupImpl(ptr: *anyopaque) void {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        self.inner.warmup();
+        for (self.extras) |entry| {
+            entry.provider.warmup();
+        }
     }
 };
 
@@ -349,36 +483,36 @@ test "parseRetryAfterMs missing" {
 }
 
 test "ReliableProvider computeBackoff uses retry-after" {
-    const provider = ReliableProvider.init(&.{}, 0, 500);
-    try std.testing.expect(provider.computeBackoff(500, "429 Retry-After: 3") == 3000);
+    const prov = ReliableProvider.init(&.{}, 0, 500);
+    try std.testing.expect(prov.computeBackoff(500, "429 Retry-After: 3") == 3000);
 }
 
 test "ReliableProvider computeBackoff caps at 30s" {
-    const provider = ReliableProvider.init(&.{}, 0, 500);
-    try std.testing.expect(provider.computeBackoff(500, "429 Retry-After: 120") == 30_000);
+    const prov = ReliableProvider.init(&.{}, 0, 500);
+    try std.testing.expect(prov.computeBackoff(500, "429 Retry-After: 120") == 30_000);
 }
 
 test "ReliableProvider computeBackoff falls back to base" {
-    const provider = ReliableProvider.init(&.{}, 0, 500);
-    try std.testing.expect(provider.computeBackoff(500, "500 Server Error") == 500);
+    const prov = ReliableProvider.init(&.{}, 0, 500);
+    try std.testing.expect(prov.computeBackoff(500, "500 Server Error") == 500);
 }
 
 test "ReliableProvider auth rotation cycles keys" {
     const keys = [_][]const u8{ "key-a", "key-b", "key-c" };
-    var provider = ReliableProvider.init(&.{}, 0, 1);
-    _ = provider.withApiKeys(&keys);
+    var prov = ReliableProvider.init(&.{}, 0, 1);
+    _ = prov.withApiKeys(&keys);
 
     // Rotate 5 times, verify round-robin
-    try std.testing.expectEqualStrings("key-a", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-b", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-c", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-a", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-b", provider.rotateKey().?);
+    try std.testing.expectEqualStrings("key-a", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-b", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-c", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-a", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-b", prov.rotateKey().?);
 }
 
 test "ReliableProvider auth rotation returns null when empty" {
-    var provider = ReliableProvider.init(&.{}, 0, 1);
-    try std.testing.expect(provider.rotateKey() == null);
+    var prov = ReliableProvider.init(&.{}, 0, 1);
+    try std.testing.expect(prov.rotateKey() == null);
 }
 
 test "isNonRetryable returns false for empty string" {
@@ -429,39 +563,39 @@ test "parseRetryAfterMs ignores non-numeric" {
 }
 
 test "ReliableProvider init enforces min backoff 50ms" {
-    const provider = ReliableProvider.init(&.{}, 0, 10);
-    try std.testing.expect(provider.base_backoff_ms == 50);
+    const prov = ReliableProvider.init(&.{}, 0, 10);
+    try std.testing.expect(prov.base_backoff_ms == 50);
 }
 
 test "ReliableProvider init keeps backoff above 50" {
-    const provider = ReliableProvider.init(&.{}, 0, 100);
-    try std.testing.expect(provider.base_backoff_ms == 100);
+    const prov = ReliableProvider.init(&.{}, 0, 100);
+    try std.testing.expect(prov.base_backoff_ms == 100);
 }
 
 test "ReliableProvider computeBackoff uses base when retry-after is smaller" {
-    const provider = ReliableProvider.init(&.{}, 0, 5000);
+    const prov = ReliableProvider.init(&.{}, 0, 5000);
     // Retry-After: 1 second = 1000ms, but base is 5000ms -> max(1000, 5000) = 5000
-    try std.testing.expect(provider.computeBackoff(5000, "429 Retry-After: 1") == 5000);
+    try std.testing.expect(prov.computeBackoff(5000, "429 Retry-After: 1") == 5000);
 }
 
 test "ReliableProvider auth rotation wraps around" {
     const keys = [_][]const u8{ "key-a", "key-b" };
-    var provider = ReliableProvider.init(&.{}, 0, 1);
-    _ = provider.withApiKeys(&keys);
+    var prov = ReliableProvider.init(&.{}, 0, 1);
+    _ = prov.withApiKeys(&keys);
 
     // Exhaust all keys and wrap
-    try std.testing.expectEqualStrings("key-a", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-b", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("key-a", provider.rotateKey().?);
+    try std.testing.expectEqualStrings("key-a", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-b", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("key-a", prov.rotateKey().?);
 }
 
 test "ReliableProvider single key rotation" {
     const keys = [_][]const u8{"only-key"};
-    var provider = ReliableProvider.init(&.{}, 0, 1);
-    _ = provider.withApiKeys(&keys);
+    var prov = ReliableProvider.init(&.{}, 0, 1);
+    _ = prov.withApiKeys(&keys);
 
-    try std.testing.expectEqualStrings("only-key", provider.rotateKey().?);
-    try std.testing.expectEqualStrings("only-key", provider.rotateKey().?);
+    try std.testing.expectEqualStrings("only-key", prov.rotateKey().?);
+    try std.testing.expectEqualStrings("only-key", prov.rotateKey().?);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -472,6 +606,7 @@ const MockInnerProvider = struct {
     call_count: u32,
     fail_until: u32,
     supports_tools: bool,
+    warmed_up: bool = false,
 
     const vtable_mock = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
@@ -479,6 +614,7 @@ const MockInnerProvider = struct {
         .supportsNativeTools = mockSupportsNativeTools,
         .getName = mockGetName,
         .deinit = mockDeinit,
+        .warmup = mockWarmup,
     };
 
     fn toProvider(self: *MockInnerProvider) Provider {
@@ -526,6 +662,108 @@ const MockInnerProvider = struct {
     }
 
     fn mockDeinit(_: *anyopaque) void {}
+
+    fn mockWarmup(ptr: *anyopaque) void {
+        const self: *MockInnerProvider = @ptrCast(@alignCast(ptr));
+        self.warmed_up = true;
+    }
+};
+
+/// Mock that records which model was used for each call.
+const ModelAwareMock = struct {
+    call_count: u32 = 0,
+    models_seen_buf: [16][]const u8 = undefined,
+    models_seen_len: usize = 0,
+    fail_models_buf: [8][]const u8 = undefined,
+    fail_models_len: usize = 0,
+    response: []const u8 = "ok",
+    supports_tools: bool = false,
+
+    const vtable_model = Provider.VTable{
+        .chatWithSystem = modelChatWithSystem,
+        .chat = modelChat,
+        .supportsNativeTools = modelSupportsNativeTools,
+        .getName = modelGetName,
+        .deinit = modelDeinit,
+    };
+
+    fn toProvider(self: *ModelAwareMock) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_model };
+    }
+
+    fn initWithFailModels(fail_models: []const []const u8, response: []const u8) ModelAwareMock {
+        var mock = ModelAwareMock{
+            .response = response,
+        };
+        const copy_len = @min(fail_models.len, mock.fail_models_buf.len);
+        for (fail_models[0..copy_len], 0..) |m, i| {
+            mock.fail_models_buf[i] = m;
+        }
+        mock.fail_models_len = copy_len;
+        return mock;
+    }
+
+    fn failsModel(self: *const ModelAwareMock, model: []const u8) bool {
+        for (self.fail_models_buf[0..self.fail_models_len]) |m| {
+            if (std.mem.eql(u8, m, model)) return true;
+        }
+        return false;
+    }
+
+    fn recordModel(self: *ModelAwareMock, model: []const u8) void {
+        if (self.models_seen_len < self.models_seen_buf.len) {
+            self.models_seen_buf[self.models_seen_len] = model;
+            self.models_seen_len += 1;
+        }
+    }
+
+    fn modelsSeen(self: *const ModelAwareMock) []const []const u8 {
+        return self.models_seen_buf[0..self.models_seen_len];
+    }
+
+    fn modelChatWithSystem(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        model: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        self.recordModel(model);
+        if (self.failsModel(model)) {
+            return error.ModelUnavailable;
+        }
+        return self.response;
+    }
+
+    fn modelChat(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        _: ChatRequest,
+        model: []const u8,
+        _: f64,
+    ) anyerror!ChatResponse {
+        const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        self.recordModel(model);
+        if (self.failsModel(model)) {
+            return error.ModelUnavailable;
+        }
+        return ChatResponse{ .content = self.response };
+    }
+
+    fn modelSupportsNativeTools(ptr: *anyopaque) bool {
+        const self: *ModelAwareMock = @ptrCast(@alignCast(ptr));
+        return self.supports_tools;
+    }
+
+    fn modelGetName(_: *anyopaque) []const u8 {
+        return "ModelAwareMock";
+    }
+
+    fn modelDeinit(_: *anyopaque) void {}
 };
 
 test "ReliableProvider vtable succeeds without retry" {
@@ -555,7 +793,7 @@ test "ReliableProvider vtable exhausts retries and returns error" {
     const prov = reliable.provider();
 
     const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
-    try std.testing.expectError(error.ProviderError, result);
+    try std.testing.expectError(error.AllProvidersFailed, result);
     // max_retries=2 means 3 attempts (0, 1, 2)
     try std.testing.expect(mock.call_count == 3);
 }
@@ -594,7 +832,177 @@ test "ReliableProvider vtable zero retries fails immediately" {
     const prov = reliable.provider();
 
     const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
-    try std.testing.expectError(error.ProviderError, result);
+    try std.testing.expectError(error.AllProvidersFailed, result);
     // With 0 retries, only 1 attempt
     try std.testing.expect(mock.call_count == 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// New tests: model fallback chain
+// ════════════════════════════════════════════════════════════════════════════
+
+test "modelChain with no fallbacks returns single element" {
+    const reliable = ReliableProvider.init(&.{}, 0, 50);
+    const chain = try reliable.modelChain(std.testing.allocator, "claude-opus");
+    defer std.testing.allocator.free(chain);
+
+    try std.testing.expect(chain.len == 1);
+    try std.testing.expectEqualStrings("claude-opus", chain[0]);
+}
+
+test "modelChain with fallbacks returns full chain" {
+    const fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "claude-opus", .fallbacks = &.{ "claude-sonnet", "claude-haiku" } },
+    };
+    const reliable = ReliableProvider.init(&.{}, 0, 50).withModelFallbacks(&fallbacks);
+    const chain = try reliable.modelChain(std.testing.allocator, "claude-opus");
+    defer std.testing.allocator.free(chain);
+
+    try std.testing.expect(chain.len == 3);
+    try std.testing.expectEqualStrings("claude-opus", chain[0]);
+    try std.testing.expectEqualStrings("claude-sonnet", chain[1]);
+    try std.testing.expectEqualStrings("claude-haiku", chain[2]);
+}
+
+test "modelChain with unrelated model returns single element" {
+    const fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "claude-opus", .fallbacks = &.{"claude-sonnet"} },
+    };
+    const reliable = ReliableProvider.init(&.{}, 0, 50).withModelFallbacks(&fallbacks);
+    const chain = try reliable.modelChain(std.testing.allocator, "gpt-4");
+    defer std.testing.allocator.free(chain);
+
+    try std.testing.expect(chain.len == 1);
+    try std.testing.expectEqualStrings("gpt-4", chain[0]);
+}
+
+test "withModelFallbacks builder preserves other fields" {
+    const fallbacks = [_]ModelFallbackEntry{
+        .{ .model = "m1", .fallbacks = &.{"m2"} },
+    };
+    const reliable = ReliableProvider.init(&.{}, 3, 200).withModelFallbacks(&fallbacks);
+    try std.testing.expect(reliable.max_retries == 3);
+    try std.testing.expect(reliable.base_backoff_ms == 200);
+    try std.testing.expect(reliable.model_fallbacks.len == 1);
+}
+
+test "withExtras builder preserves other fields" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = mock.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 100).withExtras(&extras);
+    try std.testing.expect(reliable.max_retries == 2);
+    try std.testing.expect(reliable.base_backoff_ms == 100);
+    try std.testing.expect(reliable.extras.len == 1);
+    try std.testing.expectEqualStrings("fallback", reliable.extras[0].name);
+    _ = &reliable;
+}
+
+test "single-provider ReliableProvider backward compat" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 1, 50);
+    // No extras, no model_fallbacks — default empty slices
+    try std.testing.expect(reliable.extras.len == 0);
+    try std.testing.expect(reliable.model_fallbacks.len == 0);
+
+    const prov = reliable.provider();
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.7);
+    try std.testing.expectEqualStrings("mock response", result);
+    try std.testing.expect(mock.call_count == 1);
+}
+
+test "warmup calls inner and extras" {
+    var inner_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var extra_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra_mock.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+    prov.warmup();
+
+    try std.testing.expect(inner_mock.warmed_up);
+    try std.testing.expect(extra_mock.warmed_up);
+}
+
+test "multi-provider fallback: primary fails, extra succeeds" {
+    var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+    var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = fallback.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.7);
+    try std.testing.expectEqualStrings("mock response", result);
+    // Primary tried once (0 retries), then fallback succeeded on first try
+    try std.testing.expect(primary.call_count == 1);
+    try std.testing.expect(fallback.call_count == 1);
+}
+
+test "model failover tries fallback model" {
+    const fail_models = [_][]const u8{"claude-opus"};
+    var mock = ModelAwareMock.initWithFailModels(&fail_models, "ok from sonnet");
+    const fb = [_]ModelFallbackEntry{
+        .{ .model = "claude-opus", .fallbacks = &.{"claude-sonnet"} },
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50).withModelFallbacks(&fb);
+    const prov = reliable.provider();
+
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "claude-opus", 0.7);
+    try std.testing.expectEqualStrings("ok from sonnet", result);
+
+    const seen = mock.modelsSeen();
+    try std.testing.expect(seen.len == 2);
+    try std.testing.expectEqualStrings("claude-opus", seen[0]);
+    try std.testing.expectEqualStrings("claude-sonnet", seen[1]);
+}
+
+test "model failover all models fail returns error" {
+    const fail_models = [_][]const u8{ "model-a", "model-b", "model-c" };
+    var mock = ModelAwareMock.initWithFailModels(&fail_models, "never");
+    const fb = [_]ModelFallbackEntry{
+        .{ .model = "model-a", .fallbacks = &.{ "model-b", "model-c" } },
+    };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 0, 50).withModelFallbacks(&fb);
+    const prov = reliable.provider();
+
+    const result = prov.chatWithSystem(std.testing.allocator, null, "hello", "model-a", 0.7);
+    try std.testing.expectError(error.AllProvidersFailed, result);
+
+    const seen = mock.modelsSeen();
+    try std.testing.expect(seen.len == 3);
+}
+
+test "supportsNativeTools returns true if any extra supports it" {
+    var inner_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var extra_mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "extra", .provider = extra_mock.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(inner_mock.toProvider(), 0, 50).withExtras(&extras);
+    try std.testing.expect(reliable.provider().supportsNativeTools() == true);
+}
+
+test "multi-provider chat fallback" {
+    var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+    var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+
+    const extras = [_]ProviderEntry{
+        .{ .name = "fallback", .provider = fallback.toProvider() },
+    };
+    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
+    const prov = reliable.provider();
+
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const request = ChatRequest{ .messages = &msgs };
+    const result = try prov.chat(std.testing.allocator, request, "model", 0.5);
+    try std.testing.expectEqualStrings("mock chat", result.content.?);
+    try std.testing.expect(primary.call_count == 1);
+    try std.testing.expect(fallback.call_count == 1);
 }

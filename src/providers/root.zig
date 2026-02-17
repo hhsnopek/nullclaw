@@ -114,6 +114,25 @@ pub const ChatRequest = struct {
     tools: ?[]const ToolSpec = null,
 };
 
+/// A single tool result message in a conversation.
+pub const ToolResultMessage = struct {
+    tool_call_id: []const u8,
+    content: []const u8,
+};
+
+/// Kind discriminator for ConversationMessage.
+pub const ConversationMessageKind = enum { chat, assistant_tool_calls, tool_results };
+
+/// A conversation message that can be a plain chat, assistant tool calls, or tool results.
+pub const ConversationMessage = union(ConversationMessageKind) {
+    chat: ChatMessage,
+    assistant_tool_calls: struct {
+        text: []const u8,
+        tool_calls: []const ToolCall,
+    },
+    tool_results: []const ToolResultMessage,
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // Provider Interface (vtable-based polymorphism)
 // ════════════════════════════════════════════════════════════════════════════
@@ -152,6 +171,13 @@ pub const Provider = struct {
 
         /// Clean up resources.
         deinit: *const fn (ptr: *anyopaque) void,
+
+        /// Optional: pre-warm connection. Default: no-op.
+        warmup: ?*const fn (ptr: *anyopaque) void = null,
+        /// Optional: native function calling. Default: delegates to chat().
+        chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
+        /// Optional: returns true if provider supports streaming. Default: false.
+        supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
     };
 
     pub fn chatWithSystem(
@@ -185,6 +211,23 @@ pub const Provider = struct {
 
     pub fn deinit(self: Provider) void {
         return self.vtable.deinit(self.ptr);
+    }
+
+    /// Warm up the provider connection. No-op if not implemented.
+    pub fn warmup(self: Provider) void {
+        if (self.vtable.warmup) |f| f(self.ptr);
+    }
+
+    /// Returns true if provider supports streaming.
+    pub fn supportsStreaming(self: Provider) bool {
+        if (self.vtable.supports_streaming) |f| return f(self.ptr);
+        return false;
+    }
+
+    /// Chat with native tool support. Falls back to regular chat() if not implemented.
+    pub fn chatWithTools(self: Provider, allocator: std.mem.Allocator, req: ChatRequest) !ChatResponse {
+        if (self.vtable.chat_with_tools) |f| return f(self.ptr, allocator, req);
+        return self.chat(allocator, req, req.model, req.temperature);
     }
 };
 
@@ -691,6 +734,121 @@ test "extractContent parses Anthropic format" {
     const result = try extractContent(allocator, body);
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Hello from Claude", result);
+}
+
+test "ToolResultMessage struct fields" {
+    const trm = ToolResultMessage{ .tool_call_id = "call_42", .content = "result data" };
+    try std.testing.expectEqualStrings("call_42", trm.tool_call_id);
+    try std.testing.expectEqualStrings("result data", trm.content);
+}
+
+test "ConversationMessage union variants" {
+    const chat_msg: ConversationMessage = .{ .chat = ChatMessage.user("hi") };
+    try std.testing.expect(chat_msg == .chat);
+    try std.testing.expect(chat_msg.chat.role == .user);
+
+    const calls = [_]ToolCall{.{ .id = "1", .name = "shell", .arguments = "{}" }};
+    const tc_msg: ConversationMessage = .{ .assistant_tool_calls = .{
+        .text = "calling shell",
+        .tool_calls = &calls,
+    } };
+    try std.testing.expect(tc_msg == .assistant_tool_calls);
+    try std.testing.expectEqualStrings("calling shell", tc_msg.assistant_tool_calls.text);
+
+    const results = [_]ToolResultMessage{.{ .tool_call_id = "1", .content = "ok" }};
+    const tr_msg: ConversationMessage = .{ .tool_results = &results };
+    try std.testing.expect(tr_msg == .tool_results);
+    try std.testing.expect(tr_msg.tool_results.len == 1);
+}
+
+test "provider warmup no-op when vtable warmup is null" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return "";
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            return .{};
+        }
+        fn supNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+        // warmup, chat_with_tools, supports_streaming all default to null
+    };
+    const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+    // Should not crash
+    provider.warmup();
+}
+
+test "provider supportsStreaming returns false when vtable is null" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return "";
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            return .{};
+        }
+        fn supNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+    try std.testing.expect(!provider.supportsStreaming());
+}
+
+test "provider chatWithTools falls back to chat when vtable is null" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return "";
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            return .{ .content = "fallback response", .model = "test-model" };
+        }
+        fn supNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+    const msgs = [_]ChatMessage{ChatMessage.user("test")};
+    const req = ChatRequest{ .messages = &msgs, .model = "test-model" };
+    const resp = try provider.chatWithTools(std.testing.allocator, req);
+    try std.testing.expectEqualStrings("fallback response", resp.content.?);
+    try std.testing.expectEqualStrings("test-model", resp.model);
 }
 
 test {
