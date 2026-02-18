@@ -1,5 +1,6 @@
 const std = @import("std");
 const root = @import("root.zig");
+const voice = @import("../voice.zig");
 
 const log = std.log.scoped(.telegram);
 
@@ -530,7 +531,7 @@ pub const TelegramChannel = struct {
                     const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
                     const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
 
-                    if (root.voice.transcribeTelegramVoice(allocator, self.bot_token, file_id)) |transcribed| {
+                    if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id)) |transcribed| {
                         // Prepend [Voice]: prefix
                         var result: std.ArrayListUnmanaged(u8) = .empty;
                         result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
