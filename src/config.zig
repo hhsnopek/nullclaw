@@ -63,6 +63,7 @@ pub const Config = struct {
     // Top-level fields
     api_key: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
+    groq_api_key: ?[]const u8 = null,
     default_provider: []const u8 = "openrouter",
     default_model: ?[]const u8 = "anthropic/claude-sonnet-4",
     default_temperature: f64 = 0.7,
@@ -174,6 +175,11 @@ pub const Config = struct {
         // API Key
         if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_API_KEY")) |key| {
             self.api_key = key;
+        } else |_| {}
+
+        // Groq API Key (for voice transcription)
+        if (std.process.getEnvVarOwned(self.allocator, "GROQ_API_KEY")) |key| {
+            self.groq_api_key = key;
         } else |_| {}
 
         // Provider
