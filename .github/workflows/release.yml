@@ -24,25 +24,7 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install SQLite (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y libsqlite3-dev
-
-      - name: Install SQLite (macOS)
-        if: runner.os == 'macOS'
-        run: brew list sqlite &>/dev/null || brew install sqlite
-
-      - name: Build ReleaseSmall (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          SQLITE_INC=$(pkg-config --variable=includedir sqlite3)
-          SQLITE_LIB=$(pkg-config --variable=libdir sqlite3)
-          zig build -Doptimize=ReleaseSmall \
-            -Dsqlite-include="$SQLITE_INC" \
-            -Dsqlite-lib="$SQLITE_LIB"
-
-      - name: Build ReleaseSmall (macOS)
-        if: runner.os == 'macOS'
+      - name: Build ReleaseSmall
         run: zig build -Doptimize=ReleaseSmall
 
       - name: Upload artifact
