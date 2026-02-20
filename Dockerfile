@@ -3,10 +3,15 @@
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM alpine:3.21 AS builder
 
-RUN apk add --no-cache zig musl-dev
+ARG ZIG_VERSION=0.15.2
+RUN apk add --no-cache musl-dev curl xz \
+ && curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz \
+    | tar -xJ -C /opt \
+ && ln -s /opt/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 WORKDIR /app
-COPY build.zig build.zig.zon src/ src/
+COPY build.zig build.zig.zon ./
+COPY src/ src/
 
 RUN zig build -Doptimize=ReleaseSmall
 
