@@ -538,6 +538,7 @@ test "extractHost parses correctly" {
     try testing.expectEqualStrings("example.com", net_security.extractHost("https://example.com/path").?);
     try testing.expectEqualStrings("sub.domain.org", net_security.extractHost("http://sub.domain.org?q=1").?);
     try testing.expectEqualStrings("host", net_security.extractHost("https://host:8080/").?);
+    try testing.expectEqualStrings("::1", net_security.extractHost("http://::1:8080/").?);
     try testing.expect(net_security.extractHost("ftp://nope") == null);
 }
 
@@ -547,6 +548,7 @@ test "isLocalHost detects private ranges" {
     try testing.expect(net_security.isLocalHost("10.0.0.1"));
     try testing.expect(net_security.isLocalHost("192.168.1.1"));
     try testing.expect(net_security.isLocalHost("0.0.0.0"));
+    try testing.expect(net_security.isLocalHost("[fe80::1%25lo0]"));
     try testing.expect(!net_security.isLocalHost("example.com"));
     try testing.expect(!net_security.isLocalHost("8.8.8.8"));
 }

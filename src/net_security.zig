@@ -7,29 +7,31 @@ const std = @import("std");
 
 /// Extract the hostname from an HTTP(S) URL, stripping port, path, query, fragment.
 pub fn extractHost(url: []const u8) ?[]const u8 {
-    const rest = if (std.mem.startsWith(u8, url, "https://"))
-        url[8..]
-    else if (std.mem.startsWith(u8, url, "http://"))
-        url[7..]
-    else
+    const uri = std.Uri.parse(url) catch return null;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+    {
         return null;
-
-    // Find end of authority (first / or ? or #)
-    var end: usize = rest.len;
-    for (rest, 0..) |c, i| {
-        if (c == '/' or c == '?' or c == '#') {
-            end = i;
-            break;
-        }
     }
-    const authority = rest[0..end];
-    if (authority.len == 0) return null;
 
-    // Strip port
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |colon| {
-        return authority[0..colon];
+    const host_component = uri.host orelse return null;
+    const host = switch (host_component) {
+        .raw => |h| h,
+        .percent_encoded => |h| {
+            // Percent-encoded hostnames are suspicious (e.g. %31%32%37.0.0.1
+            // to smuggle 127.0.0.1). Reject any host that actually contains a
+            // percent-escape; pass through those that the parser tagged as
+            // percent_encoded but contain no '%' (std.Uri does this sometimes).
+            if (std.mem.indexOfScalar(u8, h, '%') != null) return null;
+            return h;
+        },
+    };
+    if (host.len == 0) return null;
+    if (host[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        if (close != host.len - 1) return null;
     }
-    return authority;
+    return host;
 }
 
 /// Check if a host matches the allowlist.
@@ -66,18 +68,22 @@ pub fn isLocalHost(host: []const u8) bool {
     else
         host;
 
-    if (std.mem.eql(u8, bare, "localhost")) return true;
-    if (std.mem.endsWith(u8, bare, ".localhost")) return true;
+    // Drop IPv6 zone id suffix (e.g. "fe80::1%lo0" or "fe80::1%25lo0").
+    const unscoped = if (std.mem.indexOfScalar(u8, bare, '%')) |pct| bare[0..pct] else bare;
+    if (unscoped.len == 0) return true;
+
+    if (std.mem.eql(u8, unscoped, "localhost")) return true;
+    if (std.mem.endsWith(u8, unscoped, ".localhost")) return true;
     // .local TLD
-    if (std.mem.endsWith(u8, bare, ".local")) return true;
+    if (std.mem.endsWith(u8, unscoped, ".local")) return true;
 
     // Try to parse as IPv4
-    if (parseIpv4(bare)) |octets| {
+    if (parseIpv4(unscoped)) |octets| {
         return isNonGlobalV4(octets);
     }
 
     // Try to parse as IPv6
-    if (parseIpv6(bare)) |segments| {
+    if (parseIpv6(unscoped)) |segments| {
         return isNonGlobalV6(segments);
     }
 
@@ -285,6 +291,31 @@ test "extractHost with port" {
     try std.testing.expectEqualStrings("localhost", extractHost("http://localhost:8080/api").?);
 }
 
+test "extractHost strips userinfo safely" {
+    try std.testing.expectEqualStrings("127.0.0.1", extractHost("http://user:pass@127.0.0.1/admin").?);
+    try std.testing.expectEqualStrings("example.com", extractHost("https://user@example.com/path").?);
+}
+
+test "extractHost handles bracketed ipv6" {
+    try std.testing.expectEqualStrings("[::1]", extractHost("http://[::1]:8080/api").?);
+    try std.testing.expectEqualStrings("[2607:f8b0::1]", extractHost("https://[2607:f8b0::1]/").?);
+}
+
+test "extractHost parses unbracketed ipv6 authority with port" {
+    try std.testing.expectEqualStrings("::1", extractHost("http://::1:8080/api").?);
+}
+
+test "extractHost rejects invalid bracketed authority" {
+    try std.testing.expect(extractHost("http://[::1") == null);
+}
+
+test "extractHost rejects percent-encoded host bypass" {
+    // %31%32%37%2e%30%2e%30%2e%31 = 127.0.0.1
+    try std.testing.expect(extractHost("http://%31%32%37%2e%30%2e%30%2e%31/secret") == null);
+    // %6c%6f%63%61%6c%68%6f%73%74 = localhost
+    try std.testing.expect(extractHost("http://%6c%6f%63%61%6c%68%6f%73%74/admin") == null);
+}
+
 test "extractHost returns null for non-http scheme" {
     try std.testing.expect(extractHost("ftp://example.com") == null);
     try std.testing.expect(extractHost("file:///etc/passwd") == null);
@@ -425,6 +456,12 @@ test "isLocalHost blocks IPv6 unique-local" {
 
 test "isLocalHost blocks IPv6 link-local" {
     try std.testing.expect(isLocalHost("fe80::1"));
+}
+
+test "isLocalHost blocks IPv6 with zone id suffix" {
+    try std.testing.expect(isLocalHost("fe80::1%lo0"));
+    try std.testing.expect(isLocalHost("fe80::1%25lo0"));
+    try std.testing.expect(isLocalHost("[fe80::1%25lo0]"));
 }
 
 test "isLocalHost blocks IPv6 documentation" {
