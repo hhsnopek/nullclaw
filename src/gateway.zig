@@ -5,7 +5,7 @@
 //!   - Idempotency store (deduplicates webhook requests)
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
-//!   - Bearer token authentication (paired_tokens)
+//!   - Bearer token authentication (PairingGuard)
 //!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram
 //!
 //! Uses std.http.Server (built-in, no external deps).
@@ -18,6 +18,7 @@ const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
 const observability = @import("observability.zig");
+const PairingGuard = @import("security/pairing.zig").PairingGuard;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -205,8 +206,8 @@ pub const GatewayState = struct {
     idempotency: IdempotencyStore,
     whatsapp_verify_token: []const u8,
     whatsapp_app_secret: []const u8,
-    paired_tokens: []const []const u8,
     telegram_bot_token: []const u8,
+    pairing_guard: ?PairingGuard,
 
     pub fn init(allocator: std.mem.Allocator) GatewayState {
         return initWithVerifyToken(allocator, "");
@@ -219,14 +220,17 @@ pub const GatewayState = struct {
             .idempotency = IdempotencyStore.init(300),
             .whatsapp_verify_token = verify_token,
             .whatsapp_app_secret = "",
-            .paired_tokens = &.{},
             .telegram_bot_token = "",
+            .pairing_guard = null,
         };
     }
 
     pub fn deinit(self: *GatewayState) void {
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
+        if (self.pairing_guard) |*guard| {
+            guard.deinit();
+        }
     }
 };
 
@@ -366,6 +370,20 @@ pub fn extractBearerToken(auth_header: []const u8) ?[]const u8 {
         return auth_header[prefix.len..];
     }
     return null;
+}
+
+/// Returns true when a webhook request should be accepted for the current
+/// pairing state and bearer token. Missing pairing state fails closed.
+pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8) bool {
+    const guard = pairing_guard orelse return false;
+    if (!guard.requirePairing()) return true;
+    const token = bearer_token orelse return false;
+    return guard.isAuthenticated(token);
+}
+
+/// Format the /pair success payload. Returns null when buffer is too small.
+pub fn formatPairSuccessResponse(buf: []u8, token: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -619,6 +637,24 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     var mem_opt: ?memory_mod.Memory = null;
 
     if (config_opt) |*cfg| {
+        state.rate_limiter = GatewayRateLimiter.init(
+            cfg.gateway.pair_rate_limit_per_minute,
+            cfg.gateway.webhook_rate_limit_per_minute,
+        );
+        state.idempotency = IdempotencyStore.init(cfg.gateway.idempotency_ttl_secs);
+        state.pairing_guard = try PairingGuard.init(
+            allocator,
+            cfg.gateway.require_pairing,
+            cfg.gateway.paired_tokens,
+        );
+        if (cfg.channels.telegram) |tg_cfg| {
+            state.telegram_bot_token = tg_cfg.bot_token;
+        }
+        if (cfg.channels.whatsapp) |wa_cfg| {
+            state.whatsapp_verify_token = wa_cfg.verify_token;
+            state.whatsapp_app_secret = wa_cfg.app_secret orelse "";
+        }
+
         // Build provider holder from configured provider name.
         const api_key = cfg.defaultProviderKey() orelse "";
         holder_opt = if (std.mem.eql(u8, cfg.default_provider, "anthropic"))
@@ -668,6 +704,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, obs);
         }
     }
+    if (state.pairing_guard == null) {
+        state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
+    }
     defer if (session_mgr_opt) |*sm| sm.deinit();
     defer if (tools_slice.len > 0) allocator.free(tools_slice);
 
@@ -683,6 +722,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
     const stdout = &bw.interface;
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
+    if (state.pairing_guard) |*guard| {
+        if (guard.pairingCode()) |code| {
+            try stdout.print("Gateway pairing code: {s}\n", .{code});
+            try stdout.flush();
+        }
+    }
 
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
@@ -711,6 +756,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
         const is_post = std.mem.eql(u8, method_str, "POST");
         var response_status: []const u8 = "200 OK";
         var response_body: []const u8 = "";
+        var pair_response_buf: [256]u8 = undefined;
 
         if (std.mem.eql(u8, target, "/health") or std.mem.startsWith(u8, target, "/health?")) {
             response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -733,7 +779,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
             // Bearer token validation
             const auth_header = extractHeader(raw, "Authorization");
             const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
-            if (state.paired_tokens.len > 0 and (bearer == null or !validateBearerToken(bearer.?, state.paired_tokens))) {
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            if (!isWebhookAuthorized(pairing_guard, bearer)) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
             } else if (!state.rate_limiter.allowWebhook(state.allocator, "webhook")) {
@@ -768,7 +815,47 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16) !void {
                 response_status = "429 Too Many Requests";
                 response_body = "{\"error\":\"rate limited\"}";
             } else {
-                response_body = "{\"status\":\"paired\"}";
+                if (state.pairing_guard) |*guard| {
+                    const pairing_code = extractHeader(raw, "X-Pairing-Code");
+                    switch (guard.attemptPair(pairing_code)) {
+                        .paired => |token| {
+                            defer allocator.free(token);
+                            if (formatPairSuccessResponse(&pair_response_buf, token)) |pair_resp| {
+                                response_body = pair_resp;
+                            } else {
+                                response_status = "500 Internal Server Error";
+                                response_body = "{\"error\":\"pairing response failed\"}";
+                            }
+                        },
+                        .missing_code => {
+                            response_status = "400 Bad Request";
+                            response_body = "{\"error\":\"missing X-Pairing-Code\"}";
+                        },
+                        .invalid_code => {
+                            response_status = "401 Unauthorized";
+                            response_body = "{\"error\":\"invalid pairing code\"}";
+                        },
+                        .already_paired => {
+                            response_status = "409 Conflict";
+                            response_body = "{\"error\":\"already paired\"}";
+                        },
+                        .disabled => {
+                            response_status = "403 Forbidden";
+                            response_body = "{\"error\":\"pairing disabled\"}";
+                        },
+                        .locked_out => {
+                            response_status = "429 Too Many Requests";
+                            response_body = "{\"error\":\"pairing locked out\"}";
+                        },
+                        .internal_error => {
+                            response_status = "500 Internal Server Error";
+                            response_body = "{\"error\":\"pairing failed\"}";
+                        },
+                    }
+                } else {
+                    response_status = "500 Internal Server Error";
+                    response_body = "{\"error\":\"pairing unavailable\"}";
+                }
             }
         } else if (is_post and (std.mem.eql(u8, target, "/telegram") or std.mem.startsWith(u8, target, "/telegram?"))) {
             // POST /telegram — Telegram webhook mode
@@ -1161,6 +1248,40 @@ test "validateBearerToken exact match required" {
     try std.testing.expect(!validateBearerToken("abc12", tokens));
 }
 
+test "isWebhookAuthorized fails closed when pairing guard missing" {
+    try std.testing.expect(!isWebhookAuthorized(null, "token"));
+}
+
+test "isWebhookAuthorized allows when pairing disabled" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(isWebhookAuthorized(&guard, null));
+}
+
+test "isWebhookAuthorized requires valid bearer token when pairing enabled" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(isWebhookAuthorized(&guard, "zc_valid"));
+    try std.testing.expect(!isWebhookAuthorized(&guard, null));
+    try std.testing.expect(!isWebhookAuthorized(&guard, "zc_invalid"));
+}
+
+test "formatPairSuccessResponse includes paired token" {
+    var buf: [256]u8 = undefined;
+    const response = formatPairSuccessResponse(&buf, "zc_token_123") orelse unreachable;
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"paired\",\"token\":\"zc_token_123\"}",
+        response,
+    );
+}
+
+test "formatPairSuccessResponse fails when buffer is too small" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123") == null);
+}
+
 // ── extractHeader tests ──────────────────────────────────────────
 
 test "extractHeader finds Authorization header" {
@@ -1269,14 +1390,6 @@ test "extractBody returns null for no body" {
 test "extractBody returns null for no separator" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(extractBody(raw) == null);
-}
-
-// ── GatewayState paired_tokens tests ─────────────────────────────
-
-test "GatewayState init has empty paired_tokens" {
-    var state = GatewayState.init(std.testing.allocator);
-    defer state.deinit();
-    try std.testing.expectEqual(@as(usize, 0), state.paired_tokens.len);
 }
 
 test "GatewayState init has empty telegram_bot_token" {
