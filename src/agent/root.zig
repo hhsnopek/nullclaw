@@ -899,10 +899,13 @@ pub const Agent = struct {
 
         for (parsed_calls) |call| {
             try w.writeAll("<tool_call>\n");
-            try std.fmt.format(w, "{{\"name\": \"{s}\", \"arguments\": {s}}}", .{
-                call.name,
-                call.arguments_json,
-            });
+            const name_json = try std.json.Stringify.valueAlloc(allocator, call.name, .{});
+            defer allocator.free(name_json);
+            try w.writeAll("{\"name\": ");
+            try w.writeAll(name_json);
+            try w.writeAll(", \"arguments\": ");
+            try w.writeAll(call.arguments_json);
+            try w.writeByte('}');
             try w.writeAll("\n</tool_call>\n");
         }
 
@@ -1870,6 +1873,32 @@ test "buildAssistantHistoryWithToolCalls preserves arguments JSON" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"file_write\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "print('hello')") != null);
+}
+
+test "buildAssistantHistoryWithToolCalls escapes special chars in name" {
+    const allocator = std.testing.allocator;
+    const calls = [_]ParsedToolCall{
+        .{ .name = "shell\"injection", .arguments_json = "{}" },
+    };
+    const result = try Agent.buildAssistantHistoryWithToolCalls(
+        allocator,
+        "",
+        &calls,
+    );
+    defer allocator.free(result);
+
+    // The name should be properly JSON-escaped, so the output must be valid JSON inside <tool_call>
+    // Find the JSON between <tool_call> tags
+    const tc_start = std.mem.indexOf(u8, result, "<tool_call>\n").?;
+    const json_start = tc_start + "<tool_call>\n".len;
+    const tc_end = std.mem.indexOf(u8, result[json_start..], "\n</tool_call>").?;
+    const json_str = result[json_start .. json_start + tc_end];
+
+    // Must be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+    const name = parsed.value.object.get("name").?.string;
+    try std.testing.expectEqualStrings("shell\"injection", name);
 }
 
 // ── parseStructuredToolCalls tests ──────────────────────────────

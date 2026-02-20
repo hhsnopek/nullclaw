@@ -77,7 +77,13 @@ pub fn parseXmlToolCalls(
     defer text_parts.deinit(allocator);
 
     var calls: std.ArrayListUnmanaged(ParsedToolCall) = .empty;
-    errdefer calls.deinit(allocator);
+    errdefer {
+        for (calls.items) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        calls.deinit(allocator);
+    }
 
     var remaining = response;
 
@@ -93,12 +99,23 @@ pub fn parseXmlToolCalls(
             const inner = std.mem.trim(u8, after_open[0..end], " \t\r\n");
 
             // Try to extract JSON object from inner content (may have markdown fences or preamble text)
+            // Then fall back to <function=name><parameter=key>value</parameter></function> format
+            var call_parsed = false;
             if (extractJsonObject(inner)) |json_slice| {
-                // Parse the JSON to extract name and arguments
                 if (parseToolCallJson(allocator, json_slice)) |call| {
                     try calls.append(allocator, call);
-                } else |_| {
-                    // Malformed JSON inside tag — skip silently
+                    call_parsed = true;
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                }
+            }
+            if (!call_parsed) {
+                if (parseFunctionTagCall(allocator, inner)) |call| {
+                    try calls.append(allocator, call);
+                } else |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
                 }
             }
 
@@ -603,9 +620,85 @@ fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(
             },
         }
     } else try allocator.dupe(u8, "{}");
+    errdefer allocator.free(args_json);
 
     return .{
         .name = try allocator.dupe(u8, trimmed_name),
+        .arguments_json = args_json,
+    };
+}
+
+/// Parse `<function=NAME><parameter=KEY>VALUE</parameter>...</function>` format.
+///
+/// Some open-source LLMs (Llama, Qwen, etc.) emit this XML-based format
+/// instead of JSON inside `<tool_call>` tags. Extracts function name and
+/// parameter key-value pairs, returning a `ParsedToolCall` with serialized
+/// JSON arguments.
+fn parseFunctionTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedToolCall {
+    // Expect: <function=NAME> ... </function>
+    const func_prefix = "<function=";
+    const func_start = std.mem.indexOf(u8, inner, func_prefix) orelse return error.NoFunctionTag;
+    const after_prefix = inner[func_start + func_prefix.len ..];
+    const name_end = std.mem.indexOfScalar(u8, after_prefix, '>') orelse return error.NoFunctionTag;
+    const func_name = std.mem.trim(u8, after_prefix[0..name_end], " \t\r\n");
+    if (func_name.len == 0) return error.EmptyFunctionName;
+
+    // Validate function name: only alphanumeric, underscore, dash, dot allowed
+    for (func_name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
+            else => return error.InvalidFunctionName,
+        }
+    }
+
+    // Collect <parameter=KEY>VALUE</parameter> pairs — bounded by </function>
+    const full_body = after_prefix[name_end + 1 ..];
+    const body = if (std.mem.indexOf(u8, full_body, "</function>")) |fc|
+        full_body[0..fc]
+    else
+        full_body;
+
+    var args_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer args_buf.deinit(allocator);
+    const w = args_buf.writer(allocator);
+    try w.writeByte('{');
+
+    var remaining = body;
+    var first = true;
+    const param_prefix = "<parameter=";
+    const param_close = "</parameter>";
+
+    while (std.mem.indexOf(u8, remaining, param_prefix)) |ps| {
+        const after_param = remaining[ps + param_prefix.len ..];
+        const key_end = std.mem.indexOfScalar(u8, after_param, '>') orelse break;
+        const key = std.mem.trim(u8, after_param[0..key_end], " \t\r\n");
+        if (key.len == 0) break;
+
+        const value_start = after_param[key_end + 1 ..];
+        const value_end_pos = std.mem.indexOf(u8, value_start, param_close) orelse break;
+        const value = std.mem.trim(u8, value_start[0..value_end_pos], " \t\r\n");
+
+        if (!first) try w.writeByte(',');
+        first = false;
+
+        // Write "key": "value" with JSON string escaping via Stringify.valueAlloc
+        const key_json = try std.json.Stringify.valueAlloc(allocator, key, .{});
+        defer allocator.free(key_json);
+        const val_json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+        defer allocator.free(val_json);
+        try w.writeAll(key_json);
+        try w.writeByte(':');
+        try w.writeAll(val_json);
+
+        remaining = value_start[value_end_pos + param_close.len ..];
+    }
+
+    try w.writeByte('}');
+
+    const args_json = try args_buf.toOwnedSlice(allocator);
+    errdefer allocator.free(args_json);
+    return .{
+        .name = try allocator.dupe(u8, func_name),
         .arguments_json = args_json,
     };
 }
@@ -1009,6 +1102,124 @@ test "ToolExecutionResult default tool_call_id is null" {
         .success = true,
     };
     try std.testing.expect(result.tool_call_id == null);
+}
+
+// ── Function-tag format tests (<function=name><parameter=key>value</parameter></function>) ──
+
+test "parseFunctionTagCall single parameter" {
+    const allocator = std.testing.allocator;
+    const inner = "<function=shell><parameter=command>ps aux | grep nullclaw</parameter></function>";
+    const call = try parseFunctionTagCall(allocator, inner);
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", call.name);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ps aux | grep nullclaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "command") != null);
+}
+
+test "parseFunctionTagCall multiple parameters" {
+    const allocator = std.testing.allocator;
+    const inner = "<function=file_write><parameter=path>/tmp/test.txt</parameter><parameter=content>hello world</parameter></function>";
+    const call = try parseFunctionTagCall(allocator, inner);
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("file_write", call.name);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "/tmp/test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "hello world") != null);
+}
+
+test "parseFunctionTagCall with whitespace and newlines" {
+    const allocator = std.testing.allocator;
+    const inner =
+        \\<function=shell>
+        \\<parameter=command>
+        \\ls -la
+        \\</parameter>
+        \\</function>
+    ;
+    const call = try parseFunctionTagCall(allocator, inner);
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", call.name);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "ls -la") != null);
+}
+
+test "parseFunctionTagCall no function tag returns error" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.NoFunctionTag, parseFunctionTagCall(allocator, "just plain text"));
+}
+
+test "parseToolCalls handles function-tag format inside tool_call" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\<tool_call>
+        \\<function=shell>
+        \\<parameter=command>ps aux | grep nullclaw | grep -v grep</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "ps aux") != null);
+}
+
+test "parseToolCalls function-tag with surrounding text" {
+    const allocator = std.testing.allocator;
+    const response =
+        \\Let me check that.
+        \\<tool_call>
+        \\<function=shell>
+        \\<parameter=command>echo hi</parameter>
+        \\</function>
+        \\</tool_call>
+        \\Done.
+    ;
+    const result = try parseToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Let me check that.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "Done.") != null);
+}
+
+test "parseFunctionTagCall value with quotes is JSON-escaped" {
+    const allocator = std.testing.allocator;
+    const inner = "<function=shell><parameter=command>echo \"hello world\"</parameter></function>";
+    const call = try parseFunctionTagCall(allocator, inner);
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", call.name);
+    // Verify the JSON is valid by parsing it
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{});
+    defer parsed.deinit();
+    const cmd = parsed.value.object.get("command").?.string;
+    try std.testing.expectEqualStrings("echo \"hello world\"", cmd);
 }
 
 // ── Native tool dispatcher tests ────────────────────────────────
@@ -1560,4 +1771,70 @@ test "parseToolCallJson with unclosed brace repair" {
         allocator.free(result.arguments_json);
     }
     try std.testing.expectEqualStrings("shell", result.name);
+}
+
+// ── Hardening tests (issue #16 audit) ───────────────────────────
+
+test "parseFunctionTagCall parameters bounded by </function>" {
+    const allocator = std.testing.allocator;
+    // Two function blocks concatenated — second block's params must NOT leak into first
+    const inner = "<function=shell><parameter=command>echo hi</parameter></function><function=file_read><parameter=path>/etc/passwd</parameter></function>";
+    const call = try parseFunctionTagCall(allocator, inner);
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("shell", call.name);
+    // Only "command" parameter should be present, not "path"
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, call.arguments_json, "/etc/passwd") == null);
+}
+
+test "parseFunctionTagCall rejects invalid function name with special chars" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidFunctionName,
+        parseFunctionTagCall(allocator, "<function=shell\"><parameter=x>y</parameter></function>"),
+    );
+    try std.testing.expectError(
+        error.InvalidFunctionName,
+        parseFunctionTagCall(allocator, "<function=she<ll><parameter=x>y</parameter></function>"),
+    );
+    try std.testing.expectError(
+        error.InvalidFunctionName,
+        parseFunctionTagCall(allocator, "<function=she ll><parameter=x>y</parameter></function>"),
+    );
+}
+
+test "parseFunctionTagCall accepts valid names with dots dashes underscores" {
+    const allocator = std.testing.allocator;
+    const call = try parseFunctionTagCall(allocator, "<function=my-tool_v2.0><parameter=key>val</parameter></function>");
+    defer {
+        allocator.free(call.name);
+        allocator.free(call.arguments_json);
+    }
+    try std.testing.expectEqualStrings("my-tool_v2.0", call.name);
+}
+
+test "parseXmlToolCalls function-tag fallback when JSON has braces in value" {
+    const allocator = std.testing.allocator;
+    // The parameter value contains {hello} which extractJsonObject will pick up,
+    // but parseToolCallJson will fail — function-tag should still be tried as fallback
+    const response =
+        \\<tool_call>
+        \\<function=shell><parameter=command>echo {hello}</parameter></function>
+        \\</tool_call>
+    ;
+    const result = try parseXmlToolCalls(allocator, response);
+    defer {
+        if (result.text.len > 0) allocator.free(result.text);
+        for (result.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(result.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.calls.len);
+    try std.testing.expectEqualStrings("shell", result.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, result.calls[0].arguments_json, "echo {hello}") != null);
 }
