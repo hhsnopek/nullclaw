@@ -4,7 +4,7 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-const isResolvedPathAllowed = @import("file_edit.zig").isResolvedPathAllowed;
+const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -22,12 +22,13 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
 
-    const vtable = Tool.VTable{
-        .execute = &vtableExecute,
-        .name = &vtableName,
-        .description = &vtableDesc,
-        .parameters_json = &vtableParams,
-    };
+    pub const tool_name = "shell";
+    pub const tool_description = "Execute a shell command in the workspace directory";
+    pub const tool_params =
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
+    ;
+
+    const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *ShellTool) Tool {
         return .{
@@ -36,26 +37,7 @@ pub const ShellTool = struct {
         };
     }
 
-    fn vtableExecute(ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
-        const self: *ShellTool = @ptrCast(@alignCast(ptr));
-        return self.execute(allocator, args);
-    }
-
-    fn vtableName(_: *anyopaque) []const u8 {
-        return "shell";
-    }
-
-    fn vtableDesc(_: *anyopaque) []const u8 {
-        return "Execute a shell command in the workspace directory";
-    }
-
-    fn vtableParams(_: *anyopaque) []const u8 {
-        return 
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
-        ;
-    }
-
-    fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *ShellTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         // Parse the command from the pre-parsed JSON object
         const command = root.getString(args, "command") orelse
             return ToolResult.fail("Missing 'command' parameter");
@@ -83,17 +65,8 @@ pub const ShellTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        // Execute via platform shell
-        var child = std.process.Child.init(
-            &.{ platform.getShell(), platform.getShellFlag(), command },
-            allocator,
-        );
-        child.cwd = effective_cwd;
-
         // Clear environment to prevent leaking API keys (CWE-200),
         // then re-add only safe, functional variables.
-        child.env_map = null;
-
         var env = std.process.EnvMap.init(allocator);
         defer env.deinit();
         for (&SAFE_ENV_VARS) |key| {
@@ -102,34 +75,27 @@ pub const ShellTool = struct {
                 try env.put(key, val);
             }
         }
-        child.env_map = &env;
 
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
+        // Execute via platform shell
+        const proc = @import("process_util.zig");
+        const result = try proc.run(allocator, &.{ platform.getShell(), platform.getShellFlag(), command }, .{
+            .cwd = effective_cwd,
+            .env_map = &env,
+            .max_output_bytes = self.max_output_bytes,
+        });
+        defer allocator.free(result.stderr);
 
-        try child.spawn();
-
-        // Read stdout and stderr
-        const stdout = try child.stdout.?.readToEndAlloc(allocator, self.max_output_bytes);
-        defer allocator.free(stdout);
-        const stderr = try child.stderr.?.readToEndAlloc(allocator, self.max_output_bytes);
-        defer allocator.free(stderr);
-
-        const term = try child.wait();
-        switch (term) {
-            .Exited => |code| {
-                if (code == 0) {
-                    const out = try allocator.dupe(u8, if (stdout.len > 0) stdout else "(no output)");
-                    return ToolResult{ .success = true, .output = out };
-                } else {
-                    const err_out = try allocator.dupe(u8, if (stderr.len > 0) stderr else "Command failed with non-zero exit code");
-                    return ToolResult{ .success = false, .output = "", .error_msg = err_out };
-                }
-            },
-            else => {
-                return ToolResult{ .success = false, .output = "", .error_msg = "Command terminated by signal" };
-            },
+        if (result.success) {
+            if (result.stdout.len > 0) return ToolResult{ .success = true, .output = result.stdout };
+            allocator.free(result.stdout);
+            return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
+        defer allocator.free(result.stdout);
+        if (result.exit_code != null) {
+            const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
+            return ToolResult{ .success = false, .output = "", .error_msg = err_out };
+        }
+        return ToolResult{ .success = false, .output = "", .error_msg = "Command terminated by signal" };
     }
 };
 

@@ -430,18 +430,6 @@ pub const Config = struct {
         try w.flush();
     }
 
-    pub fn ensureDirs(self: *const Config) !void {
-        const dir = std.fs.path.dirname(self.config_path) orelse return;
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-        std.fs.makeDirAbsolute(self.workspace_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
-
     // ── Validation ──────────────────────────────────────────────
 
     pub const ValidationError = error{

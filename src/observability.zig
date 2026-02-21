@@ -305,7 +305,7 @@ pub const FileObserver = struct {
 };
 
 /// Factory: create observer from config backend string.
-pub fn createObserver(backend: []const u8) []const u8 {
+fn createObserver(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "log")) return "log";
     if (std.mem.eql(u8, backend, "verbose")) return "verbose";
     if (std.mem.eql(u8, backend, "file")) return "file";

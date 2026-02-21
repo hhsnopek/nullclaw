@@ -157,8 +157,8 @@ pub const OpenRouterProvider = struct {
     /// Pre-warm TLS connection by hitting auth endpoint. Best-effort, ignores errors.
     pub fn warmup(self: *OpenRouterProvider) void {
         const api_key = self.api_key orelse return;
-        const auth_hdr = std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{api_key}) catch return;
-        defer self.allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return;
         const resp = curlGet(self.allocator, WARMUP_URL, auth_hdr) catch return;
         self.allocator.free(resp);
     }
@@ -245,14 +245,14 @@ pub const OpenRouterProvider = struct {
         , .{ model, msgs_json, temperature });
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenRouterApiError;
 
-        const referer_hdr = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{REFERER});
-        defer allocator.free(referer_hdr);
+        var referer_hdr_buf: [256]u8 = undefined;
+        const referer_hdr = std.fmt.bufPrint(&referer_hdr_buf, "HTTP-Referer: {s}", .{REFERER}) catch return error.OpenRouterApiError;
 
-        const title_hdr = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{TITLE});
-        defer allocator.free(title_hdr);
+        var title_hdr_buf: [128]u8 = undefined;
+        const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
         const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);
@@ -296,14 +296,14 @@ pub const OpenRouterProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenRouterApiError;
 
-        const referer_hdr = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{REFERER});
-        defer allocator.free(referer_hdr);
+        var referer_hdr_buf: [256]u8 = undefined;
+        const referer_hdr = std.fmt.bufPrint(&referer_hdr_buf, "HTTP-Referer: {s}", .{REFERER}) catch return error.OpenRouterApiError;
 
-        const title_hdr = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{TITLE});
-        defer allocator.free(title_hdr);
+        var title_hdr_buf: [128]u8 = undefined;
+        const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
         const resp_body = root.curlPost(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);
@@ -324,14 +324,14 @@ pub const OpenRouterProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenRouterApiError;
 
-        const referer_hdr = try std.fmt.allocPrint(allocator, "HTTP-Referer: {s}", .{REFERER});
-        defer allocator.free(referer_hdr);
+        var referer_hdr_buf: [256]u8 = undefined;
+        const referer_hdr = std.fmt.bufPrint(&referer_hdr_buf, "HTTP-Referer: {s}", .{REFERER}) catch return error.OpenRouterApiError;
 
-        const title_hdr = try std.fmt.allocPrint(allocator, "X-Title: {s}", .{TITLE});
-        defer allocator.free(title_hdr);
+        var title_hdr_buf: [128]u8 = undefined;
+        const title_hdr = std.fmt.bufPrint(&title_hdr_buf, "X-Title: {s}", .{TITLE}) catch return error.OpenRouterApiError;
 
         const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{ auth_hdr, referer_hdr, title_hdr }, request.timeout_secs) catch return error.OpenRouterApiError;
         defer allocator.free(resp_body);

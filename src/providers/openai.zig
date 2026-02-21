@@ -184,8 +184,8 @@ pub const OpenAiProvider = struct {
         const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
         return sse.curlStream(allocator, BASE_URL, body, auth_hdr, &.{}, callback, callback_ctx);
     }
@@ -208,8 +208,8 @@ pub const OpenAiProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
         const resp_body = root.curlPost(allocator, BASE_URL, body, &.{auth_hdr}) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);
@@ -230,8 +230,8 @@ pub const OpenAiProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        const auth_hdr = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-        defer allocator.free(auth_hdr);
+        var auth_hdr_buf: [512]u8 = undefined;
+        const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
         const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{auth_hdr}, request.timeout_secs) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);

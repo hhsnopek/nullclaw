@@ -16,12 +16,14 @@ const I2C_ADDR_MAX: u7 = 0x77;
 /// I2C hardware tool — detect buses, scan devices, read/write registers.
 /// On non-Linux platforms, all actions return a platform-not-supported error.
 pub const I2cTool = struct {
-    const vtable = Tool.VTable{
-        .execute = &vtableExecute,
-        .name = &vtableName,
-        .description = &vtableDesc,
-        .parameters_json = &vtableParams,
-    };
+    pub const tool_name = "i2c";
+    pub const tool_description = "I2C hardware tool. Actions: detect (list buses), scan (find devices on bus), " ++
+        "read (read register bytes), write (write register byte). Linux only.";
+    pub const tool_params =
+        \\{"type":"object","properties":{"action":{"type":"string","description":"Action: detect, scan, read, write"},"bus":{"type":"integer","description":"I2C bus number (e.g. 1 for /dev/i2c-1)"},"address":{"type":"string","description":"Device address in hex (0x03-0x77)"},"register":{"type":"integer","description":"Register number to read/write"},"value":{"type":"integer","description":"Byte value to write (0-255)"},"length":{"type":"integer","description":"Number of bytes to read (default 1)"}},"required":["action"]}
+    ;
+
+    const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *I2cTool) Tool {
         return .{
@@ -30,27 +32,7 @@ pub const I2cTool = struct {
         };
     }
 
-    fn vtableExecute(ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
-        _ = ptr;
-        return execute(allocator, args);
-    }
-
-    fn vtableName(_: *anyopaque) []const u8 {
-        return "i2c";
-    }
-
-    fn vtableDesc(_: *anyopaque) []const u8 {
-        return "I2C hardware tool. Actions: detect (list buses), scan (find devices on bus), " ++
-            "read (read register bytes), write (write register byte). Linux only.";
-    }
-
-    fn vtableParams(_: *anyopaque) []const u8 {
-        return 
-        \\{"type":"object","properties":{"action":{"type":"string","description":"Action: detect, scan, read, write"},"bus":{"type":"integer","description":"I2C bus number (e.g. 1 for /dev/i2c-1)"},"address":{"type":"string","description":"Device address in hex (0x03-0x77)"},"register":{"type":"integer","description":"Register number to read/write"},"value":{"type":"integer","description":"Byte value to write (0-255)"},"length":{"type":"integer","description":"Number of bytes to read (default 1)"}},"required":["action"]}
-        ;
-    }
-
-    fn execute(allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(_: *I2cTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 

@@ -400,34 +400,29 @@ fn classifyMedium(base: []const u8, first_arg_raw: ?[]const u8) bool {
 }
 
 fn isGitMediumVerb(verb: []const u8) bool {
-    const verbs = [_][]const u8{
-        "commit",      "push",   "reset",  "clean",    "rebase", "merge",
-        "cherry-pick", "revert", "branch", "checkout", "switch", "tag",
-    };
-    for (&verbs) |v| {
-        if (std.mem.eql(u8, verb, v)) return true;
-    }
-    return false;
+    const map = std.StaticStringMap(void).initComptime(.{
+        .{ "commit", {} },      .{ "push", {} },   .{ "reset", {} },
+        .{ "clean", {} },       .{ "rebase", {} }, .{ "merge", {} },
+        .{ "cherry-pick", {} }, .{ "revert", {} }, .{ "branch", {} },
+        .{ "checkout", {} },    .{ "switch", {} }, .{ "tag", {} },
+    });
+    return map.has(verb);
 }
 
 fn isNpmMediumVerb(verb: []const u8) bool {
-    const verbs = [_][]const u8{
-        "install", "add", "remove", "uninstall", "update", "publish",
-    };
-    for (&verbs) |v| {
-        if (std.mem.eql(u8, verb, v)) return true;
-    }
-    return false;
+    const map = std.StaticStringMap(void).initComptime(.{
+        .{ "install", {} },   .{ "add", {} },    .{ "remove", {} },
+        .{ "uninstall", {} }, .{ "update", {} }, .{ "publish", {} },
+    });
+    return map.has(verb);
 }
 
 fn isCargoMediumVerb(verb: []const u8) bool {
-    const verbs = [_][]const u8{
-        "add", "remove", "install", "clean", "publish",
-    };
-    for (&verbs) |v| {
-        if (std.mem.eql(u8, verb, v)) return true;
-    }
-    return false;
+    const map = std.StaticStringMap(void).initComptime(.{
+        .{ "add", {} },   .{ "remove", {} },  .{ "install", {} },
+        .{ "clean", {} }, .{ "publish", {} },
+    });
+    return map.has(verb);
 }
 
 /// Check if a path has ".." as a component (handles both `/` and `\` separators)

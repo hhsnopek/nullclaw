@@ -3,77 +3,11 @@ const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
+const isPathSafe = @import("path_security.zig").isPathSafe;
+const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 
 /// Default maximum file size to read for editing (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
-
-/// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
-const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
-    "/System",
-    "/Library",
-    "/bin",
-    "/sbin",
-    "/usr/bin",
-    "/usr/sbin",
-    "/usr/lib",
-    "/usr/libexec",
-    "/etc",
-    "/private/etc",
-    "/private/var",
-    "/dev",
-    "/boot",
-    "/proc",
-    "/sys",
-};
-
-/// System-critical prefixes (Windows).
-const SYSTEM_BLOCKED_PREFIXES_WINDOWS = [_][]const u8{
-    "C:\\Windows",
-    "C:\\Program Files",
-    "C:\\Program Files (x86)",
-    "C:\\ProgramData",
-    "C:\\System32",
-    "C:\\Recovery",
-};
-
-/// Platform-selected system blocked prefixes.
-pub const SYSTEM_BLOCKED_PREFIXES: []const []const u8 = if (@import("builtin").os.tag == .windows)
-    &SYSTEM_BLOCKED_PREFIXES_WINDOWS
-else
-    &SYSTEM_BLOCKED_PREFIXES_UNIX;
-
-/// Check whether a directory-style prefix matches (exact or followed by a path separator).
-fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
-    if (path.len == prefix.len) return true;
-    const c = path[prefix.len];
-    return c == '/' or c == '\\';
-}
-
-/// Check whether a **resolved** absolute path is allowed by the policy:
-///  1. System blocklist always rejects.
-///  2. Workspace prefix matches → allowed.
-///  3. Any allowed_path prefix matches (resolved on the fly) → allowed.
-pub fn isResolvedPathAllowed(
-    allocator: std.mem.Allocator,
-    resolved: []const u8,
-    ws_resolved: []const u8,
-    allowed_paths: []const []const u8,
-) bool {
-    // 1. System blocklist
-    for (SYSTEM_BLOCKED_PREFIXES) |prefix| {
-        if (pathStartsWith(resolved, prefix)) return false;
-    }
-    // 2. Workspace
-    if (pathStartsWith(resolved, ws_resolved)) return true;
-    // 3. Allowed paths (resolve each to handle symlinks)
-    for (allowed_paths) |ap| {
-        const ap_resolved = std.fs.cwd().realpathAlloc(allocator, ap) catch continue;
-        defer allocator.free(ap_resolved);
-        if (pathStartsWith(resolved, ap_resolved)) return true;
-    }
-    return false;
-}
 
 /// Find and replace text in a file with workspace path scoping.
 pub const FileEditTool = struct {
@@ -81,12 +15,13 @@ pub const FileEditTool = struct {
     allowed_paths: []const []const u8 = &.{},
     max_file_size: usize = DEFAULT_MAX_FILE_SIZE,
 
-    const vtable = Tool.VTable{
-        .execute = &vtableExecute,
-        .name = &vtableName,
-        .description = &vtableDesc,
-        .parameters_json = &vtableParams,
-    };
+    pub const tool_name = "file_edit";
+    pub const tool_description = "Find and replace text in a file";
+    pub const tool_params =
+        \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"},"old_text":{"type":"string","description":"Text to find in the file"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path","old_text","new_text"]}
+    ;
+
+    const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *FileEditTool) Tool {
         return .{
@@ -95,26 +30,7 @@ pub const FileEditTool = struct {
         };
     }
 
-    fn vtableExecute(ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
-        const self: *FileEditTool = @ptrCast(@alignCast(ptr));
-        return self.execute(allocator, args);
-    }
-
-    fn vtableName(_: *anyopaque) []const u8 {
-        return "file_edit";
-    }
-
-    fn vtableDesc(_: *anyopaque) []const u8 {
-        return "Find and replace text in a file";
-    }
-
-    fn vtableParams(_: *anyopaque) []const u8 {
-        return 
-        \\{"type":"object","properties":{"path":{"type":"string","description":"Relative path to the file within the workspace"},"old_text":{"type":"string","description":"Text to find in the file"},"new_text":{"type":"string","description":"Replacement text"}},"required":["path","old_text","new_text"]}
-        ;
-    }
-
-    fn execute(self: *FileEditTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    pub fn execute(self: *FileEditTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const path = root.getString(args, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
@@ -198,17 +114,6 @@ pub const FileEditTool = struct {
         return ToolResult{ .success = true, .output = msg };
     }
 };
-
-/// Check if a relative path is safe (no traversal, no absolute path).
-pub fn isPathSafe(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) return false;
-    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    var iter = std.mem.splitAny(u8, path, "/\\");
-    while (iter.next()) |component| {
-        if (std.mem.eql(u8, component, "..")) return false;
-    }
-    return true;
-}
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -374,112 +279,6 @@ test "file_edit empty old_text" {
 
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "must not be empty") != null);
-}
-
-// ── isResolvedPathAllowed tests ─────────────────────────────────────
-
-test "isResolvedPathAllowed allows workspace path" {
-    try std.testing.expect(isResolvedPathAllowed(
-        std.testing.allocator,
-        "/home/user/workspace/file.txt",
-        "/home/user/workspace",
-        &.{},
-    ));
-}
-
-test "isResolvedPathAllowed allows exact workspace" {
-    try std.testing.expect(isResolvedPathAllowed(
-        std.testing.allocator,
-        "/home/user/workspace",
-        "/home/user/workspace",
-        &.{},
-    ));
-}
-
-test "isResolvedPathAllowed rejects outside workspace" {
-    try std.testing.expect(!isResolvedPathAllowed(
-        std.testing.allocator,
-        "/home/user/other/file.txt",
-        "/home/user/workspace",
-        &.{},
-    ));
-}
-
-test "isResolvedPathAllowed rejects partial prefix match" {
-    // /home/user/workspace-evil should NOT match /home/user/workspace
-    try std.testing.expect(!isResolvedPathAllowed(
-        std.testing.allocator,
-        "/home/user/workspace-evil/file.txt",
-        "/home/user/workspace",
-        &.{},
-    ));
-}
-
-test "isResolvedPathAllowed blocks system paths" {
-    if (comptime @import("builtin").os.tag == .windows) {
-        // Windows uses its own SYSTEM_BLOCKED_PREFIXES (C:\Windows, etc.)
-        try std.testing.expect(!isResolvedPathAllowed(
-            std.testing.allocator,
-            "C:\\Windows\\system32\\cmd.exe",
-            "C:\\Users\\ws",
-            &.{},
-        ));
-        try std.testing.expect(!isResolvedPathAllowed(
-            std.testing.allocator,
-            "C:\\Program Files\\app\\evil.exe",
-            "C:\\Users\\ws",
-            &.{},
-        ));
-    } else {
-        try std.testing.expect(!isResolvedPathAllowed(
-            std.testing.allocator,
-            "/etc/passwd",
-            "/etc",
-            &.{},
-        ));
-        try std.testing.expect(!isResolvedPathAllowed(
-            std.testing.allocator,
-            "/System/Library/something",
-            "/home/ws",
-            &.{"/System"},
-        ));
-        try std.testing.expect(!isResolvedPathAllowed(
-            std.testing.allocator,
-            "/bin/sh",
-            "/home/ws",
-            &.{"/bin"},
-        ));
-    }
-}
-
-test "isResolvedPathAllowed allows via allowed_paths" {
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "" });
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "test.txt" });
-    defer std.testing.allocator.free(file_path);
-
-    try std.testing.expect(isResolvedPathAllowed(
-        std.testing.allocator,
-        file_path,
-        "/nonexistent-workspace",
-        &.{tmp_path},
-    ));
-}
-
-test "pathStartsWith exact match" {
-    try std.testing.expect(pathStartsWith("/foo/bar", "/foo/bar"));
-}
-
-test "pathStartsWith with trailing component" {
-    try std.testing.expect(pathStartsWith("/foo/bar/baz", "/foo/bar"));
-}
-
-test "pathStartsWith rejects partial" {
-    try std.testing.expect(!pathStartsWith("/foo/barbaz", "/foo/bar"));
 }
 
 // ── Absolute path support tests ─────────────────────────────────────

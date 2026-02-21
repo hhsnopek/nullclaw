@@ -110,18 +110,34 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
         existing.deinit();
     }
 
-    // Upsert provider entry
+    // Upsert provider entry.
+    // After put() succeeds, the map owns these allocations and the defer
+    // block above handles cleanup.  The flag prevents errdefer double-frees
+    // if a subsequent try (serialization / file I/O) fails.
+    var put_succeeded = false;
     const key_owned = try allocator.dupe(u8, provider);
+    errdefer if (!put_succeeded) allocator.free(key_owned);
     if (existing.fetchSwapRemove(key_owned)) |old| {
         allocator.free(old.key);
         freeStoredToken(allocator, old.value);
     }
+    const at_owned = try allocator.dupe(u8, token.access_token);
+    errdefer if (!put_succeeded) allocator.free(at_owned);
+    const rt_owned: ?[]const u8 = if (token.refresh_token) |rt| try allocator.dupe(u8, rt) else null;
+    errdefer {
+        if (!put_succeeded) {
+            if (rt_owned) |rt| allocator.free(rt);
+        }
+    }
+    const tt_owned = try allocator.dupe(u8, token.token_type);
+    errdefer if (!put_succeeded) allocator.free(tt_owned);
     try existing.put(key_owned, .{
-        .access_token = try allocator.dupe(u8, token.access_token),
-        .refresh_token = if (token.refresh_token) |rt| try allocator.dupe(u8, rt) else null,
+        .access_token = at_owned,
+        .refresh_token = rt_owned,
         .expires_at = token.expires_at,
-        .token_type = try allocator.dupe(u8, token.token_type),
+        .token_type = tt_owned,
     });
+    put_succeeded = true;
 
     // Serialize
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -511,10 +527,16 @@ fn parseDeviceCodeResponse(allocator: std.mem.Allocator, body: []const u8) !Devi
         else => 900,
     } else 900;
 
+    const dc_owned = try allocator.dupe(u8, dc);
+    errdefer allocator.free(dc_owned);
+    const uc_owned = try allocator.dupe(u8, uc);
+    errdefer allocator.free(uc_owned);
+    const vu_owned = try allocator.dupe(u8, vu);
+
     return .{
-        .device_code = try allocator.dupe(u8, dc),
-        .user_code = try allocator.dupe(u8, uc),
-        .verification_uri = try allocator.dupe(u8, vu),
+        .device_code = dc_owned,
+        .user_code = uc_owned,
+        .verification_uri = vu_owned,
         .interval = interval,
         .expires_in = expires_in,
     };
@@ -617,11 +639,17 @@ fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) !OAuthToke
         else => "Bearer",
     } else "Bearer";
 
+    const at_owned = try allocator.dupe(u8, at);
+    errdefer allocator.free(at_owned);
+    const rt_owned: ?[]const u8 = if (rt) |r| try allocator.dupe(u8, r) else null;
+    errdefer if (rt_owned) |r| allocator.free(r);
+    const tt_owned = try allocator.dupe(u8, tt);
+
     return .{
-        .access_token = try allocator.dupe(u8, at),
-        .refresh_token = if (rt) |r| try allocator.dupe(u8, r) else null,
+        .access_token = at_owned,
+        .refresh_token = rt_owned,
         .expires_at = std.time.timestamp() + expires_in,
-        .token_type = try allocator.dupe(u8, tt),
+        .token_type = tt_owned,
     };
 }
 

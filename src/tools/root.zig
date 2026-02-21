@@ -81,6 +81,8 @@ pub const file_append = @import("file_append.zig");
 pub const spawn = @import("spawn.zig");
 pub const i2c = @import("i2c.zig");
 pub const spi = @import("spi.zig");
+pub const path_security = @import("path_security.zig");
+pub const process_util = @import("process_util.zig");
 
 // ── Core types ──────────────────────────────────────────────────────
 
@@ -153,6 +155,39 @@ pub const Tool = struct {
         };
     }
 };
+
+/// Generate a Tool.VTable from a tool struct type at comptime.
+///
+/// The type T must declare:
+///   - `pub const tool_name: []const u8`
+///   - `pub const tool_description: []const u8`
+///   - `pub const tool_params: []const u8`
+///   - `fn execute(self: *T, allocator: Allocator, args: JsonObjectMap) anyerror!ToolResult`
+pub fn ToolVTable(comptime T: type) Tool.VTable {
+    return .{
+        .execute = &struct {
+            fn f(ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult {
+                const self: *T = @ptrCast(@alignCast(ptr));
+                return self.execute(allocator, args);
+            }
+        }.f,
+        .name = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_name;
+            }
+        }.f,
+        .description = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_description;
+            }
+        }.f,
+        .parameters_json = &struct {
+            fn f(_: *anyopaque) []const u8 {
+                return T.tool_params;
+            }
+        }.f,
+    };
+}
 
 /// Comptime check that a type correctly implements the Tool interface.
 pub fn assertToolInterface(comptime T: type) void {
