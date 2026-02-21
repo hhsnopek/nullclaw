@@ -53,22 +53,14 @@ pub const ChannelRuntime = struct {
     tools: []const tools_mod.Tool,
     mem: ?memory_mod.Memory,
     noop_obs: *observability.NoopObserver,
-    resolved_api_key: ?[]u8 = null,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
-        // Resolve API key: config providers first, then env vars
-        const resolved_key = providers.resolveApiKeyFromConfig(
-            allocator,
-            config.default_provider,
-            config.providers,
-        ) catch null;
-
         // Provider — heap-allocated for vtable pointer stability
         const holder = try allocator.create(ProviderHolder);
         errdefer allocator.destroy(holder);
 
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key);
+        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, config.defaultProviderKey());
 
         const provider_i = holder.provider();
 
@@ -88,7 +80,7 @@ pub const ChannelRuntime = struct {
             .screenshot_enabled = true,
             .mcp_tools = mcp_tools,
             .agents = config.agents,
-            .fallback_api_key = resolved_key,
+            .fallback_api_key = config.defaultProviderKey(),
             .tools_config = config.tools,
         }) catch &.{};
         errdefer if (tools.len > 0) allocator.free(tools);
@@ -121,7 +113,6 @@ pub const ChannelRuntime = struct {
             .tools = tools,
             .mem = mem_opt,
             .noop_obs = noop_obs,
-            .resolved_api_key = resolved_key,
         };
         return self;
     }
@@ -130,7 +121,6 @@ pub const ChannelRuntime = struct {
         const alloc = self.allocator;
         self.session_mgr.deinit();
         if (self.tools.len > 0) alloc.free(self.tools);
-        if (self.resolved_api_key) |k| alloc.free(k);
         alloc.destroy(self.noop_obs);
         alloc.destroy(self.provider_holder);
         alloc.destroy(self);
