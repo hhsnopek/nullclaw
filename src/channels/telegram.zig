@@ -439,7 +439,7 @@ pub const TelegramChannel = struct {
         try self.sendMediaMultipart(chat_id, allocator, .document, doc_path, caption);
     }
 
-    /// Send any media type via curl multipart form POST.
+    /// Send any media type via native HTTP multipart/form-data POST.
     fn sendMediaMultipart(
         self: *TelegramChannel,
         chat_id: []const u8,
@@ -451,59 +451,64 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, kind.apiMethod());
 
-        // Build file form field: field=@path
-        var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
-        try file_fbs.writer().print("{s}=@{s}", .{ kind.formField(), file_path });
-        const file_arg = file_fbs.getWritten();
+        // Read file contents
+        const file = std.fs.cwd().openFile(file_path, .{}) catch return error.FileNotFound;
+        defer file.close();
+        const file_data = file.readToEndAlloc(allocator, 50 * 1024 * 1024) catch return error.FileReadFailed;
+        defer allocator.free(file_data);
 
-        // Build chat_id form field
-        var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
+        // Extract filename from path
+        const filename = if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |pos|
+            file_path[pos + 1 ..]
+        else
+            file_path;
 
-        // Build argv
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
+        // Build multipart/form-data body
+        const boundary = "----ZigMultipartBoundary7d2a3c";
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
 
-        // Optional caption
-        var caption_arg_buf: [1024]u8 = undefined;
+        // chat_id field
+        try body.appendSlice(allocator, "--" ++ boundary ++ "\r\n");
+        try body.appendSlice(allocator, "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n");
+        try body.appendSlice(allocator, chat_id);
+        try body.appendSlice(allocator, "\r\n");
+
+        // Optional caption field
         if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
-            argc += 1;
+            try body.appendSlice(allocator, "--" ++ boundary ++ "\r\n");
+            try body.appendSlice(allocator, "Content-Disposition: form-data; name=\"caption\"\r\n\r\n");
+            try body.appendSlice(allocator, cap);
+            try body.appendSlice(allocator, "\r\n");
         }
 
-        argv_buf[argc] = url;
-        argc += 1;
+        // File field
+        try body.appendSlice(allocator, "--" ++ boundary ++ "\r\n");
+        try body.appendSlice(allocator, "Content-Disposition: form-data; name=\"");
+        try body.appendSlice(allocator, kind.formField());
+        try body.appendSlice(allocator, "\"; filename=\"");
+        try body.appendSlice(allocator, filename);
+        try body.appendSlice(allocator, "\"\r\n");
+        try body.appendSlice(allocator, "Content-Type: application/octet-stream\r\n\r\n");
+        try body.appendSlice(allocator, file_data);
+        try body.appendSlice(allocator, "\r\n");
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        // Closing boundary
+        try body.appendSlice(allocator, "--" ++ boundary ++ "--\r\n");
 
-        _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-        const term = child.wait() catch return error.CurlWaitError;
-        switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
-        }
+        // Content-Type header with boundary
+        const content_type = "multipart/form-data; boundary=" ++ boundary;
+
+        // POST via native HTTP
+        const resp = try root.http_util.curlPostWithProxy(
+            allocator,
+            url,
+            body.items,
+            &.{std.fmt.comptimePrint("Content-Type: {s}", .{content_type})},
+            self.proxy,
+            null,
+        );
+        allocator.free(resp);
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -995,7 +1000,7 @@ pub const TypingIndicator = struct {
         self.chat_id_len = chat_id.len;
         self.running.store(true, .release);
 
-        self.thread = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{self}) catch null;
+        self.thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, typingLoop, .{self}) catch null;
     }
 
     /// Stop the periodic typing indicator.

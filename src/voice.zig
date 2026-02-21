@@ -124,8 +124,8 @@ pub fn transcribeFile(
         return error.ApiRequestFailed;
     const auth_hdr = auth_fbs.getWritten();
 
-    // POST via curl using --data-binary @tempfile
-    const resp = curlPostFromFile(
+    // POST via native HTTP client
+    const resp = nativePostFromFile(
         allocator,
         endpoint,
         tmp_path,
@@ -254,68 +254,58 @@ fn parseTranscriptionText(allocator: std.mem.Allocator, json_resp: []const u8) !
     return try allocator.dupe(u8, text_val.string);
 }
 
-/// HTTP POST via curl subprocess, reading body from a file on disk.
+/// HTTP POST using native std.http.Client, reading body from a file on disk.
 /// Used for multipart/form-data where body has already been written to a temp file.
-fn curlPostFromFile(
+fn nativePostFromFile(
     allocator: std.mem.Allocator,
     url: []const u8,
     file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
-    // Build data-binary arg: @/path/to/file
-    var data_arg_buf: [300]u8 = undefined;
-    var data_fbs = std.io.fixedBufferStream(&data_arg_buf);
-    try data_fbs.writer().print("@{s}", .{file_path});
-    const data_arg = data_fbs.getWritten();
+    // Read the file into memory
+    const file = std.fs.openFileAbsolute(file_path, .{}) catch return error.FileReadFailed;
+    defer file.close();
+    const file_data = file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.FileReadFailed;
+    defer allocator.free(file_data);
 
-    var argv_buf: [32][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
+    // Parse "Name: Value" headers into std.http.Header structs
+    var extra_hdrs: [10]std.http.Header = undefined;
+    var hdr_count: usize = 0;
     for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+        if (hdr_count >= 10) break;
+        if (std.mem.indexOfScalar(u8, hdr, ':')) |colon| {
+            const name = hdr[0..colon];
+            var value = hdr[colon + 1 ..];
+            if (value.len > 0 and value[0] == ' ') value = value[1..];
+            extra_hdrs[hdr_count] = .{ .name = name, .value = value };
+            hdr_count += 1;
+        }
     }
 
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = data_arg;
-    argc += 1;
-    argv_buf[argc] = url;
-    argc += 1;
+    var client: std.http.Client = .{ .allocator = allocator };
+    defer client.deinit();
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer allocator.free(aw.writer.buffer);
 
-    try child.spawn();
+    const result = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .POST,
+        .payload = file_data,
+        .extra_headers = extra_hdrs[0..hdr_count],
+        .response_writer = &aw.writer,
+    }) catch return error.ApiRequestFailed;
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
+    if (result.status.class() == .server_error or result.status.class() == .client_error) {
+        log.err("Whisper API returned {}", .{result.status});
+        return error.ApiRequestFailed;
     }
 
-    return stdout;
+    // Return the response body as an owned slice
+    const response = aw.writer.buffer[0..aw.writer.end];
+    const owned = try allocator.dupe(u8, response);
+    allocator.free(aw.writer.buffer);
+    return owned;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
