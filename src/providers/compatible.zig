@@ -580,9 +580,23 @@ fn serializeMessagesInto(
 
         if (!first_user_done and msg.role == .user and sys_buf.items.len > 0) {
             first_user_done = true;
-            const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sys_buf.items, msg.content });
-            defer allocator.free(merged);
-            try root.appendJsonString(buf, allocator, merged);
+            if (msg.content_parts) |parts| {
+                // Multimodal: prepend system as text part, keep image parts
+                const prefix = try std.fmt.allocPrint(allocator, "[System: {s}]", .{sys_buf.items});
+                defer allocator.free(prefix);
+                const new_parts = try allocator.alloc(root.ContentPart, parts.len + 1);
+                defer allocator.free(new_parts);
+                new_parts[0] = .{ .text = prefix };
+                @memcpy(new_parts[1..], parts);
+                var patched = msg;
+                patched.content_parts = new_parts;
+                try serializeMessageContent(buf, allocator, patched);
+            } else {
+                // Plain text: existing merge
+                const merged = try std.fmt.allocPrint(allocator, "[System: {s}]\n\n{s}", .{ sys_buf.items, msg.content });
+                defer allocator.free(merged);
+                try root.appendJsonString(buf, allocator, merged);
+            }
         } else {
             try serializeMessageContent(buf, allocator, msg);
         }
@@ -1305,4 +1319,50 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     const content = messages.items[0].object.get("content").?.string;
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
+}
+
+test "merge_system_into_user preserves multimodal content_parts" {
+    const allocator = std.testing.allocator;
+    const parts = [_]root.ContentPart{
+        root.makeTextPart("Describe this image"),
+        root.makeImageUrlPart("https://example.com/img.png"),
+    };
+    const msgs = [_]root.ChatMessage{
+        root.ChatMessage.system("Be helpful"),
+        .{ .role = .user, .content = "", .content_parts = &parts },
+    };
+    const req = root.ChatRequest{ .messages = &msgs, .model = "test" };
+
+    const body = try buildChatRequestBody(allocator, req, "test", 0.7, true);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    // System message should be merged, only 1 message left
+    try std.testing.expect(messages.items.len == 1);
+    try std.testing.expectEqualStrings("user", messages.items[0].object.get("role").?.string);
+
+    // Content should be an array (multimodal), not a string
+    const content = messages.items[0].object.get("content").?.array;
+    // 3 parts: system prefix text + original text + original image_url
+    try std.testing.expect(content.items.len == 3);
+
+    // First part: system prefix text
+    const first = content.items[0].object;
+    try std.testing.expectEqualStrings("text", first.get("type").?.string);
+    const first_text = first.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, first_text, "[System: Be helpful]") != null);
+
+    // Second part: original text
+    const second = content.items[1].object;
+    try std.testing.expectEqualStrings("text", second.get("type").?.string);
+    try std.testing.expectEqualStrings("Describe this image", second.get("text").?.string);
+
+    // Third part: image_url
+    const third = content.items[2].object;
+    try std.testing.expectEqualStrings("image_url", third.get("type").?.string);
+    const img_obj = third.get("image_url").?.object;
+    try std.testing.expectEqualStrings("https://example.com/img.png", img_obj.get("url").?.string);
 }
