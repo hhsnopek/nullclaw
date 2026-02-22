@@ -90,6 +90,44 @@ pub fn isLocalHost(host: []const u8) bool {
     return false;
 }
 
+/// Resolve hostname and reject if any resolved IP is local/private/reserved.
+/// This closes SSRF bypasses via numeric host aliases (e.g. 2130706433) and
+/// DNS rebinding-style domains that resolve to loopback/private addresses.
+pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port: u16) bool {
+    const bare = if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]"))
+        host[1 .. host.len - 1]
+    else
+        host;
+
+    const addr_list = std.net.getAddressList(allocator, bare, port) catch return false;
+    defer addr_list.deinit();
+
+    for (addr_list.addrs) |addr| {
+        switch (addr.any.family) {
+            std.posix.AF.INET => {
+                const octets: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+                if (isNonGlobalV4(octets.*)) return true;
+            },
+            std.posix.AF.INET6 => {
+                const bytes = addr.in6.sa.addr;
+                const segs = [8]u16{
+                    (@as(u16, bytes[0]) << 8) | bytes[1],
+                    (@as(u16, bytes[2]) << 8) | bytes[3],
+                    (@as(u16, bytes[4]) << 8) | bytes[5],
+                    (@as(u16, bytes[6]) << 8) | bytes[7],
+                    (@as(u16, bytes[8]) << 8) | bytes[9],
+                    (@as(u16, bytes[10]) << 8) | bytes[11],
+                    (@as(u16, bytes[12]) << 8) | bytes[13],
+                    (@as(u16, bytes[14]) << 8) | bytes[15],
+                };
+                if (isNonGlobalV6(segs)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Returns true if the IPv4 address is not globally routable.
 fn isNonGlobalV4(addr: [4]u8) bool {
     const a = addr[0];
@@ -543,4 +581,9 @@ test "URL extraction works correctly" {
     try std.testing.expectEqualStrings("sub.example.com", extractHost("http://sub.example.com/").?);
     try std.testing.expect(extractHost("ftp://nope.com") == null);
     try std.testing.expect(extractHost("https:///") == null);
+}
+
+test "hostResolvesToLocal blocks decimal and hex loopback aliases" {
+    try std.testing.expect(hostResolvesToLocal(std.testing.allocator, "2130706433", 80));
+    try std.testing.expect(hostResolvesToLocal(std.testing.allocator, "0x7f000001", 80));
 }

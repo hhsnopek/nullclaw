@@ -38,11 +38,18 @@ pub const HttpRequestTool = struct {
             return ToolResult.fail("Only http:// and https:// URLs are allowed");
         }
 
+        // Build URI
+        const uri = std.Uri.parse(url) catch
+            return ToolResult.fail("Invalid URL format");
+
+        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+        const resolved_port: u16 = uri.port orelse default_port;
+
         // Block localhost/private IPs (SSRF protection)
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
 
-        if (net_security.isLocalHost(host)) {
+        if (net_security.isLocalHost(host) or net_security.hostResolvesToLocal(allocator, host, resolved_port)) {
             return ToolResult.fail("Blocked local/private host");
         }
 
@@ -58,10 +65,6 @@ pub const HttpRequestTool = struct {
             const msg = try std.fmt.allocPrint(allocator, "Unsupported HTTP method: {s}", .{method_str});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
-
-        // Build URI
-        const uri = std.Uri.parse(url) catch
-            return ToolResult.fail("Invalid URL format");
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
@@ -450,6 +453,16 @@ test "execute rejects 10.x private range" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "execute rejects loopback decimal alias SSRF" {
+    var ht = HttpRequestTool{};
+    const t = ht.tool();
+    const parsed = try root.parseTestArgs("{\"url\": \"http://2130706433/admin\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "local") != null);
 }
 
 test "execute rejects unsupported method" {

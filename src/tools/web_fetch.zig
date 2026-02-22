@@ -45,10 +45,15 @@ pub const WebFetchTool = struct {
             return ToolResult.fail("Only http:// and https:// URLs are allowed");
         }
 
+        const uri = std.Uri.parse(url) catch
+            return ToolResult.fail("Invalid URL format");
+        const default_port: u16 = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) 443 else 80;
+        const resolved_port: u16 = uri.port orelse default_port;
+
         // SSRF protection — block local/private hosts
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
-        if (net_security.isLocalHost(host))
+        if (net_security.isLocalHost(host) or net_security.hostResolvesToLocal(allocator, host, resolved_port))
             return ToolResult.fail("Blocked local/private host");
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
@@ -56,9 +61,6 @@ pub const WebFetchTool = struct {
         // Fetch URL
         var client: std.http.Client = .{ .allocator = allocator };
         defer client.deinit();
-
-        const uri = std.Uri.parse(url) catch
-            return ToolResult.fail("Invalid URL format");
 
         var req = client.request(.GET, uri, buildRequestOptions()) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
@@ -456,6 +458,15 @@ test "WebFetchTool private IP blocked" {
     defer p3.deinit();
     const r3 = try wft.execute(testing.allocator, p3.value.object);
     try testing.expect(!r3.success);
+}
+
+test "WebFetchTool loopback decimal alias blocked" {
+    var wft = WebFetchTool{};
+    const parsed = try root.parseTestArgs("{\"url\":\"http://2130706433/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
 test "web_fetch disables automatic redirects" {
