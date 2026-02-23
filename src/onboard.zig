@@ -142,7 +142,35 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
+
+    // For providers without a curated fallback list, return a single-item fallback
+    // based on the onboarding default model for that provider.
+    if (providerDefaultFallback(canonical)) |models| return models;
+
     return &anthropic_fallback;
+}
+
+const ProviderFallback = struct {
+    key: []const u8,
+    models: []const []const u8,
+};
+
+const provider_default_fallbacks = blk: {
+    var rows: [known_providers.len]ProviderFallback = undefined;
+    for (known_providers, 0..) |p, i| {
+        rows[i] = .{
+            .key = p.key,
+            .models = &[_][]const u8{p.default_model},
+        };
+    }
+    break :blk rows;
+};
+
+fn providerDefaultFallback(provider: []const u8) ?[]const []const u8 {
+    for (provider_default_fallbacks) |entry| {
+        if (std.mem.eql(u8, entry.key, provider)) return entry.models;
+    }
+    return null;
 }
 
 const openrouter_fallback = [_][]const u8{
@@ -1631,6 +1659,16 @@ test "fallbackModelsForProvider unknown returns anthropic fallback" {
     const models = fallbackModelsForProvider("some-unknown-provider");
     try std.testing.expect(models.len >= 3);
     try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+}
+
+test "fallbackModelsForProvider uses provider defaults for uncataloged providers" {
+    const qwen_models = fallbackModelsForProvider("qwen");
+    try std.testing.expect(qwen_models.len >= 1);
+    try std.testing.expectEqualStrings("qwen-3-max", qwen_models[0]);
+
+    const z_ai_models = fallbackModelsForProvider("z.ai");
+    try std.testing.expect(z_ai_models.len >= 1);
+    try std.testing.expectEqualStrings("glm-5", z_ai_models[0]);
 }
 
 test "parseModelIds extracts IDs from OpenRouter-style response" {
