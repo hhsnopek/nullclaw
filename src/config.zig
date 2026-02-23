@@ -288,6 +288,43 @@ pub const Config = struct {
         }
     }
 
+    fn writeStringArray(w: *std.Io.Writer, values: []const []const u8) !void {
+        try w.print("[", .{});
+        for (values, 0..) |value, i| {
+            if (i > 0) try w.print(", ", .{});
+            try w.print("\"{s}\"", .{value});
+        }
+        try w.print("]", .{});
+    }
+
+    fn writeReliabilitySection(self: *const Config, w: *std.Io.Writer) !void {
+        try w.print("  \"reliability\": {{\n", .{});
+        try w.print("    \"provider_retries\": {d},\n", .{self.reliability.provider_retries});
+        try w.print("    \"provider_backoff_ms\": {d},\n", .{self.reliability.provider_backoff_ms});
+        try w.print("    \"channel_initial_backoff_secs\": {d},\n", .{self.reliability.channel_initial_backoff_secs});
+        try w.print("    \"channel_max_backoff_secs\": {d},\n", .{self.reliability.channel_max_backoff_secs});
+        try w.print("    \"scheduler_poll_secs\": {d},\n", .{self.reliability.scheduler_poll_secs});
+        try w.print("    \"scheduler_retries\": {d},\n", .{self.reliability.scheduler_retries});
+
+        try w.print("    \"fallback_providers\": ", .{});
+        try writeStringArray(w, self.reliability.fallback_providers);
+        try w.print(",\n", .{});
+
+        try w.print("    \"api_keys\": ", .{});
+        try writeStringArray(w, self.reliability.api_keys);
+        try w.print(",\n", .{});
+
+        try w.print("    \"model_fallbacks\": [", .{});
+        for (self.reliability.model_fallbacks, 0..) |entry, i| {
+            if (i > 0) try w.print(", ", .{});
+            try w.print("{{\"model\": \"{s}\", \"fallbacks\": ", .{entry.model});
+            try writeStringArray(w, entry.fallbacks);
+            try w.print("}}", .{});
+        }
+        try w.print("]\n", .{});
+        try w.print("  }},\n", .{});
+    }
+
     /// Apply NULLCLAW_* environment variable overrides.
     pub fn applyEnvOverrides(self: *Config) void {
         // Provider
@@ -442,6 +479,9 @@ pub const Config = struct {
             try w.print("    \"max_actions_per_hour\": {d}\n", .{self.autonomy.max_actions_per_hour});
         }
         try w.print("  }},\n", .{});
+
+        // Reliability
+        try self.writeReliabilitySection(w);
 
         // Channels
         try self.writeChannelsSection(w);
@@ -607,6 +647,52 @@ test "validation rejects bad temperature" {
     try std.testing.expectError(Config.ValidationError.TemperatureOutOfRange, cfg.validate());
 }
 
+test "json parse reads reliability fallback providers and model fallbacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const json =
+        \\{
+        \\  "default_provider": "openai-codex",
+        \\  "default_model": "gpt-5.3-codex",
+        \\  "reliability": {
+        \\    "provider_retries": 3,
+        \\    "provider_backoff_ms": 750,
+        \\    "fallback_providers": ["openrouter", "groq"],
+        \\    "api_keys": ["key_a", "key_b"],
+        \\    "model_fallbacks": [
+        \\      {"model": "gpt-5.3-codex", "fallbacks": ["openrouter/anthropic/claude-sonnet-4"]},
+        \\      {"model": "claude-opus-4", "fallbacks": ["claude-sonnet-4", "claude-haiku-3.5"]}
+        \\    ]
+        \\  }
+        \\}
+    ;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(u32, 3), cfg.reliability.provider_retries);
+    try std.testing.expectEqual(@as(u64, 750), cfg.reliability.provider_backoff_ms);
+    try std.testing.expectEqual(@as(usize, 2), cfg.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("openrouter", cfg.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("groq", cfg.reliability.fallback_providers[1]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.reliability.api_keys.len);
+    try std.testing.expectEqualStrings("key_a", cfg.reliability.api_keys[0]);
+    try std.testing.expectEqualStrings("key_b", cfg.reliability.api_keys[1]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.reliability.model_fallbacks.len);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", cfg.reliability.model_fallbacks[0].model);
+    try std.testing.expectEqual(@as(usize, 1), cfg.reliability.model_fallbacks[0].fallbacks.len);
+    try std.testing.expectEqualStrings(
+        "openrouter/anthropic/claude-sonnet-4",
+        cfg.reliability.model_fallbacks[0].fallbacks[0],
+    );
+}
+
 test "validation rejects zero port" {
     var cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -684,6 +770,76 @@ test "save writes configured telegram channel account" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"accounts\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": {\"account_id\":\"main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_token\":\"123:ABC\"") != null);
+}
+
+test "save roundtrip preserves reliability settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    const fallback_models = [_][]const u8{
+        "openrouter/anthropic/claude-sonnet-4",
+        "groq/llama-3.3-70b",
+    };
+    const model_fallbacks = [_]ModelFallbackEntry{
+        .{
+            .model = "gpt-5.3-codex",
+            .fallbacks = &fallback_models,
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.reliability.provider_retries = 4;
+    cfg.reliability.provider_backoff_ms = 1200;
+    cfg.reliability.channel_initial_backoff_secs = 5;
+    cfg.reliability.channel_max_backoff_secs = 90;
+    cfg.reliability.scheduler_poll_secs = 20;
+    cfg.reliability.scheduler_retries = 3;
+    cfg.reliability.fallback_providers = &.{ "openrouter", "groq" };
+    cfg.reliability.api_keys = &.{ "rk_a", "rk_b" };
+    cfg.reliability.model_fallbacks = &model_fallbacks;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(u32, 4), loaded.reliability.provider_retries);
+    try std.testing.expectEqual(@as(u64, 1200), loaded.reliability.provider_backoff_ms);
+    try std.testing.expectEqual(@as(u64, 5), loaded.reliability.channel_initial_backoff_secs);
+    try std.testing.expectEqual(@as(u64, 90), loaded.reliability.channel_max_backoff_secs);
+    try std.testing.expectEqual(@as(u64, 20), loaded.reliability.scheduler_poll_secs);
+    try std.testing.expectEqual(@as(u32, 3), loaded.reliability.scheduler_retries);
+    try std.testing.expectEqual(@as(usize, 2), loaded.reliability.fallback_providers.len);
+    try std.testing.expectEqualStrings("openrouter", loaded.reliability.fallback_providers[0]);
+    try std.testing.expectEqualStrings("groq", loaded.reliability.fallback_providers[1]);
+    try std.testing.expectEqual(@as(usize, 2), loaded.reliability.api_keys.len);
+    try std.testing.expectEqualStrings("rk_a", loaded.reliability.api_keys[0]);
+    try std.testing.expectEqualStrings("rk_b", loaded.reliability.api_keys[1]);
+    try std.testing.expectEqual(@as(usize, 1), loaded.reliability.model_fallbacks.len);
+    try std.testing.expectEqualStrings("gpt-5.3-codex", loaded.reliability.model_fallbacks[0].model);
+    try std.testing.expectEqual(@as(usize, 2), loaded.reliability.model_fallbacks[0].fallbacks.len);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", loaded.reliability.model_fallbacks[0].fallbacks[0]);
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", loaded.reliability.model_fallbacks[0].fallbacks[1]);
 }
 
 test "syncFlatFields propagates nested values" {

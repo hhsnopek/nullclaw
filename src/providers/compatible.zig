@@ -1,6 +1,7 @@
 const std = @import("std");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
+const error_classify = @import("error_classify.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -306,6 +307,10 @@ pub const OpenAiCompatibleProvider = struct {
         defer parsed.deinit();
         const root_obj = parsed.value.object;
 
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
+
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
@@ -326,6 +331,10 @@ pub const OpenAiCompatibleProvider = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
         const root_obj = parsed.value.object;
+
+        if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+            return error_classify.kindToError(kind);
+        }
 
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
@@ -746,6 +755,13 @@ test "parseTextResponse empty choices" {
         \\{"choices":[]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse classifies rate-limit errors" {
+    const body =
+        \\{"error":{"message":"Too many requests","type":"rate_limit_error","status":429}}
+    ;
+    try std.testing.expectError(error.RateLimited, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
 }
 
 test "authHeaderValue bearer style" {

@@ -97,13 +97,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .tracker = &tracker,
     };
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = providers.resolveApiKeyFromConfig(
-        allocator,
-        cfg.default_provider,
-        cfg.providers,
-    ) catch null;
-    defer if (resolved_api_key) |k| allocator.free(k);
+    // Provider runtime bundle (primary provider + reliability wrapper).
+    var runtime_provider = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &cfg);
+    defer runtime_provider.deinit();
+    const resolved_api_key = runtime_provider.primaryApiKey();
 
     // Create tools (with agents config for delegate depth enforcement)
     const tools = try tools_mod.allTools(allocator, cfg.workspace_dir, .{
@@ -127,15 +124,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else |_| {}
     defer if (mem_opt) |m| m.deinit();
 
-    // Create provider via centralized ProviderHolder (concrete struct lives on the stack)
-    var holder = providers.ProviderHolder.fromConfig(
-        allocator,
-        cfg.default_provider,
-        resolved_api_key,
-        cfg.getProviderBaseUrl(cfg.default_provider),
-    );
-    defer holder.deinit();
-    const provider_i: Provider = holder.provider();
+    // Provider interface from runtime bundle (includes retries/fallbacks).
+    const provider_i: Provider = runtime_provider.provider();
 
     const supports_streaming = provider_i.supportsStreaming();
 

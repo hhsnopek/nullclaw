@@ -560,6 +560,51 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (rel.object.get("provider_backoff_ms")) |v| {
                 if (v == .integer) self.reliability.provider_backoff_ms = @intCast(v.integer);
             }
+            if (rel.object.get("fallback_providers")) |v| {
+                if (v == .array) self.reliability.fallback_providers = try parseStringArray(self.allocator, v.array);
+            }
+            if (rel.object.get("api_keys")) |v| {
+                if (v == .array) self.reliability.api_keys = try parseStringArray(self.allocator, v.array);
+            }
+            if (rel.object.get("model_fallbacks")) |v| {
+                if (v == .array) {
+                    var fallback_entries: std.ArrayListUnmanaged(types.ModelFallbackEntry) = .empty;
+                    errdefer {
+                        for (fallback_entries.items) |entry| {
+                            for (entry.fallbacks) |fb| self.allocator.free(fb);
+                            self.allocator.free(entry.fallbacks);
+                            self.allocator.free(entry.model);
+                        }
+                        fallback_entries.deinit(self.allocator);
+                    }
+
+                    for (v.array.items) |entry| {
+                        if (entry != .object) continue;
+                        const model_val = entry.object.get("model") orelse continue;
+                        if (model_val != .string) continue;
+
+                        const model_trimmed = std.mem.trim(u8, model_val.string, " \t\r\n");
+                        if (model_trimmed.len == 0) continue;
+
+                        const fallbacks_val = entry.object.get("fallbacks") orelse continue;
+                        if (fallbacks_val != .array) continue;
+
+                        const model_copy = try self.allocator.dupe(u8, model_trimmed);
+                        const fallback_copy = try parseStringArray(self.allocator, fallbacks_val.array);
+                        fallback_entries.append(self.allocator, .{
+                            .model = model_copy,
+                            .fallbacks = fallback_copy,
+                        }) catch |err| {
+                            self.allocator.free(model_copy);
+                            for (fallback_copy) |fb| self.allocator.free(fb);
+                            self.allocator.free(fallback_copy);
+                            return err;
+                        };
+                    }
+
+                    self.reliability.model_fallbacks = try fallback_entries.toOwnedSlice(self.allocator);
+                }
+            }
             if (rel.object.get("channel_initial_backoff_secs")) |v| {
                 if (v == .integer) self.reliability.channel_initial_backoff_secs = @intCast(v.integer);
             }

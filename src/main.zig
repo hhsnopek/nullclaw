@@ -835,6 +835,29 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
 
 // ── Signal Channel ─────────────────────────────────────────────────
 
+fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const yc.config.Config) bool {
+    for (config.reliability.api_keys) |raw_key| {
+        if (std.mem.trim(u8, raw_key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (yc.providers.classifyProvider(provider_name) == .openai_codex_provider) return true;
+
+        const resolved = yc.providers.resolveApiKeyFromConfig(
+            allocator,
+            provider_name,
+            config.providers,
+        ) catch null;
+        defer if (resolved) |k| allocator.free(k);
+
+        if (resolved) |key| {
+            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+        }
+    }
+
+    return false;
+}
+
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
     _ = args;
 
@@ -848,7 +871,8 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider) {
+    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
         std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
@@ -971,10 +995,10 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
     defer if (mem_opt) |m| m.deinit();
 
-    // Create provider
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key, config.getProviderBaseUrl(config.default_provider));
-    defer holder.deinit();
-    const provider_i = holder.provider();
+    // Create provider with reliability wrapper (retry + fallback chains).
+    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
+    defer runtime_provider.deinit();
+    const provider_i = runtime_provider.provider();
 
     // Create noop observer
     var noop_obs = yc.observability.NoopObserver{};
@@ -1146,7 +1170,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
 
     // OAuth providers (openai-codex) don't need an API key
     const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider) {
+    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, &config);
+    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
         std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
         std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
         std.process.exit(1);
@@ -1249,10 +1274,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var noop_obs = yc.observability.NoopObserver{};
     const obs = noop_obs.observer();
 
-    // Create provider vtable — concrete struct must stay alive for the loop.
-    var holder = yc.providers.ProviderHolder.fromConfig(allocator, config.default_provider, resolved_api_key, config.getProviderBaseUrl(config.default_provider));
-    defer holder.deinit();
-    const provider_i: yc.providers.Provider = holder.provider();
+    // Create provider with reliability wrapper (retry + fallback chains).
+    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
+    defer runtime_provider.deinit();
+    const provider_i: yc.providers.Provider = runtime_provider.provider();
 
     std.debug.print("  Tools: {d} loaded\n", .{tools.len});
     std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});

@@ -1992,12 +1992,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     }
     defer if (owned_config) |*c| c.deinit();
 
-    // ProviderHolder: concrete provider struct must outlive the accept loop.
-    var holder_opt: ?providers.ProviderHolder = null;
+    // Provider runtime bundle (primary + reliability wrapper) must outlive the accept loop.
+    var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
-    var resolved_api_key: ?[]const u8 = null;
+    var noop_obs_gateway = observability.NoopObserver{};
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -2040,19 +2040,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_account_id = lark_cfg.account_id;
         }
 
-        // Resolve API key: config providers first, then env vars
-        resolved_api_key = providers.resolveApiKeyFromConfig(
-            allocator,
-            cfg.default_provider,
-            cfg.providers,
-        ) catch null;
+        provider_bundle_opt = try providers.runtime_bundle.RuntimeProviderBundle.init(allocator, cfg);
 
-        // Build provider holder from configured provider name.
-        holder_opt = providers.ProviderHolder.fromConfig(allocator, cfg.default_provider, resolved_api_key, cfg.getProviderBaseUrl(cfg.default_provider));
-
-        // Build provider vtable from the holder.
-        if (holder_opt) |*h| {
-            const provider_i: providers.Provider = h.provider();
+        if (provider_bundle_opt) |*bundle| {
+            const provider_i: providers.Provider = bundle.provider();
+            const resolved_api_key = bundle.primaryApiKey();
 
             // Optional memory backend.
             const db_path = std.fs.path.joinZ(allocator, &.{ cfg.workspace_dir, "memory.db" }) catch null;
@@ -2072,18 +2064,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .fallback_api_key = resolved_api_key,
             }) catch &.{};
 
-            // Noop observer.
-            var noop_obs = observability.NoopObserver{};
-            const obs = noop_obs.observer();
-
-            session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, obs);
+            session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer());
         }
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
-    defer if (resolved_api_key) |k| allocator.free(k);
-    defer if (holder_opt) |*h| h.deinit();
+    defer if (provider_bundle_opt) |*bundle| bundle.deinit();
     defer if (mem_opt) |m| m.deinit();
     defer if (tools_slice.len > 0) tools_mod.deinitTools(allocator, tools_slice);
     defer if (session_mgr_opt) |*sm| sm.deinit();

@@ -15,6 +15,7 @@ pub const sse = @import("sse.zig");
 pub const claude_cli = @import("claude_cli.zig");
 pub const codex_cli = @import("codex_cli.zig");
 pub const openai_codex = @import("openai_codex.zig");
+pub const runtime_bundle = @import("runtime_bundle.zig");
 
 // Extracted sub-modules
 pub const scrub = @import("scrub.zig");

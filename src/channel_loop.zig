@@ -17,6 +17,7 @@ const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const agent_routing = @import("agent_routing.zig");
+const provider_runtime = @import("providers/runtime_bundle.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -67,31 +68,19 @@ pub const ProviderHolder = providers.ProviderHolder;
 pub const ChannelRuntime = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
-    resolved_api_key: ?[]const u8,
     session_mgr: session_mod.SessionManager,
-    provider_holder: *ProviderHolder,
+    provider_bundle: provider_runtime.RuntimeProviderBundle,
     tools: []const tools_mod.Tool,
     mem: ?memory_mod.Memory,
     noop_obs: *observability.NoopObserver,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
-        // Resolve API key: config providers first, then env vars
-        const resolved_key = providers.resolveApiKeyFromConfig(
-            allocator,
-            config.default_provider,
-            config.providers,
-        ) catch null;
-        errdefer if (resolved_key) |k| allocator.free(k);
+        var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
+        errdefer runtime_provider.deinit();
 
-        // Provider — heap-allocated for vtable pointer stability
-        const holder = try allocator.create(ProviderHolder);
-        errdefer allocator.destroy(holder);
-
-        holder.* = ProviderHolder.fromConfig(allocator, config.default_provider, resolved_key, config.getProviderBaseUrl(config.default_provider));
-        errdefer holder.deinit();
-
-        const provider_i = holder.provider();
+        const provider_i = runtime_provider.provider();
+        const resolved_key = runtime_provider.primaryApiKey();
 
         // MCP tools
         const mcp_tools: ?[]const tools_mod.Tool = if (config.mcp_servers.len > 0)
@@ -140,9 +129,8 @@ pub const ChannelRuntime = struct {
         self.* = .{
             .allocator = allocator,
             .config = config,
-            .resolved_api_key = resolved_key,
             .session_mgr = session_mgr,
-            .provider_holder = holder,
+            .provider_bundle = runtime_provider,
             .tools = tools,
             .mem = mem_opt,
             .noop_obs = noop_obs,
@@ -155,10 +143,8 @@ pub const ChannelRuntime = struct {
         self.session_mgr.deinit();
         if (self.tools.len > 0) tools_mod.deinitTools(alloc, self.tools);
         if (self.mem) |m| m.deinit();
-        self.provider_holder.deinit();
-        if (self.resolved_api_key) |k| alloc.free(k);
+        self.provider_bundle.deinit();
         alloc.destroy(self.noop_obs);
-        alloc.destroy(self.provider_holder);
         alloc.destroy(self);
     }
 };
