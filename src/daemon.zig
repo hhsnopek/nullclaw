@@ -160,44 +160,55 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     }
 }
 
-/// Initial backoff for scheduler restarts (seconds).
-const SCHEDULER_INITIAL_BACKOFF_SECS: u64 = 1;
-
-/// Maximum backoff for scheduler restarts (seconds).
-const SCHEDULER_MAX_BACKOFF_SECS: u64 = 60;
-
 /// How often the channel watcher checks health (seconds).
 const CHANNEL_WATCH_INTERVAL_SECS: u64 = 60;
 
-/// Scheduler supervision thread — loads cron jobs and runs the scheduler loop.
-/// On error (scheduler crash), logs and restarts with exponential backoff.
+/// Initial backoff for scheduler restarts (seconds).
+/// Kept for compatibility with existing tests and supervision semantics.
+const SCHEDULER_INITIAL_BACKOFF_SECS: u64 = 1;
+
+/// Maximum backoff for scheduler restarts (seconds).
+/// Kept for compatibility with existing tests and supervision semantics.
+const SCHEDULER_MAX_BACKOFF_SECS: u64 = 60;
+
+/// Scheduler thread — executes due cron jobs and periodically reloads cron.json
+/// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
-    var backoff_secs: u64 = SCHEDULER_INITIAL_BACKOFF_SECS;
+    var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    defer scheduler.deinit();
+
+    const poll_secs: u64 = @max(@as(u64, 1), config.reliability.scheduler_poll_secs);
+
+    // Initial load from disk (ignore errors — start empty if file missing/corrupt)
+    cron.loadJobs(&scheduler) catch {};
+
+    state.markRunning("scheduler");
+    health.markComponentOk("scheduler");
 
     while (!isShutdownRequested()) {
-        var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
-        defer scheduler.deinit();
+        // Refresh scheduler view from store so jobs created/updated after daemon startup are picked up.
+        cron.reloadJobs(&scheduler) catch |err| {
+            log.warn("scheduler reload failed: {}", .{err});
+            state.markError("scheduler", @errorName(err));
+            health.markComponentError("scheduler", @errorName(err));
+        };
 
-        // Load persisted jobs (ignore errors — fresh start if file missing)
-        cron.loadJobs(&scheduler) catch {};
+        const changed = scheduler.tick(std.time.timestamp(), event_bus);
+        if (changed) {
+            cron.saveJobs(&scheduler) catch |err| {
+                log.warn("scheduler save failed: {}", .{err});
+                state.markError("scheduler", @errorName(err));
+                health.markComponentError("scheduler", @errorName(err));
+            };
+        }
 
         state.markRunning("scheduler");
         health.markComponentOk("scheduler");
 
-        // run() blocks forever (while(true) loop) — if it returns, something went wrong.
-        // Since run() can't actually return an error (it catches internally), we treat
-        // any return from run() as an unexpected exit.
-        scheduler.run(config.reliability.scheduler_poll_secs, event_bus);
-
-        // If we reach here, scheduler exited unexpectedly
-        if (isShutdownRequested()) break;
-
-        state.markError("scheduler", "unexpected exit");
-        health.markComponentError("scheduler", "unexpected exit");
-
-        // Exponential backoff before restart
-        std.Thread.sleep(backoff_secs * std.time.ns_per_s);
-        backoff_secs = computeBackoff(backoff_secs, SCHEDULER_MAX_BACKOFF_SECS);
+        var slept: u64 = 0;
+        while (slept < poll_secs and !isShutdownRequested()) : (slept += 1) {
+            std.Thread.sleep(std.time.ns_per_s);
+        }
     }
 }
 
