@@ -41,6 +41,10 @@ pub const SlackChannel = struct {
     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
     pub const RECONNECT_DELAY_NS: u64 = 5 * std.time.ns_per_s;
     pub const POLL_INTERVAL_SECS: u64 = 3;
+    pub const SOCKET_THREAD_STACK_SIZE: usize = switch (builtin.cpu.arch) {
+        .aarch64, .arm => 1024 * 1024,
+        else => 256 * 1024,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -639,7 +643,7 @@ pub const SlackChannel = struct {
         switch (self.mode) {
             .socket => {
                 if (self.app_token == null) return error.SlackAppTokenRequired;
-                self.socket_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, socketLoop, .{self});
+                self.socket_thread = try std.Thread.spawn(.{ .stack_size = SOCKET_THREAD_STACK_SIZE }, socketLoop, .{self});
             },
             .http => {
                 const secret = self.signing_secret orelse return error.SlackSigningSecretRequired;
@@ -963,6 +967,14 @@ test "slack channel health check" {
     ch.poll_thread = t;
     defer ch.poll_thread = null;
     try std.testing.expect(ch.healthCheck());
+}
+
+test "slack socket thread stack size is architecture-aware" {
+    if (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .arm) {
+        try std.testing.expectEqual(@as(usize, 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
+    } else {
+        try std.testing.expectEqual(@as(usize, 256 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
+    }
 }
 
 test "slack channel user allowed wildcard" {
