@@ -453,6 +453,10 @@ pub const SlackChannel = struct {
         return true;
     }
 
+    fn shouldCountSocketFailure(err: anyerror) bool {
+        return err != error.ShouldReconnect;
+    }
+
     fn componentAsSlice(component: std.Uri.Component) []const u8 {
         return switch (component) {
             .raw => |v| v,
@@ -594,20 +598,25 @@ pub const SlackChannel = struct {
     fn socketLoop(self: *SlackChannel) void {
         var consecutive_socket_failures: u32 = 0;
         while (self.running.load(.acquire)) {
-            self.runSocketOnce() catch |err| {
-                if (err != error.SlackAppTokenRequired) {
-                    log.warn("Slack socket cycle failed: {}", .{err});
+            if (self.runSocketOnce()) |_| {
+                consecutive_socket_failures = 0;
+            } else |err| {
+                if (shouldCountSocketFailure(err)) {
+                    if (err != error.SlackAppTokenRequired) {
+                        log.warn("Slack socket cycle failed: {}", .{err});
+                    }
+                    consecutive_socket_failures +|= 1;
+                } else {
+                    consecutive_socket_failures = 0;
                 }
-                consecutive_socket_failures +|= 1;
 
                 const should_fallback = err == error.SlackAppTokenRequired or
                     consecutive_socket_failures >= SOCKET_FAILURE_FALLBACK_THRESHOLD;
                 if (should_fallback and self.activatePollingFallback(@errorName(err))) {
                     return;
                 }
-            };
+            }
             if (!self.running.load(.acquire)) break;
-            consecutive_socket_failures = 0;
 
             var slept: u64 = 0;
             while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
@@ -1063,6 +1072,12 @@ test "slack sticky fallback flag keeps polling mode when targets exist" {
     var ch = SlackChannel.init(std.testing.allocator, "tok", "xapp-valid", "C123", &.{});
     ch.socket_fallback_to_polling.store(true, .release);
     try std.testing.expect(ch.shouldUsePollingFallbackForSocketStart());
+}
+
+test "slack socket reconnect does not count toward fallback failures" {
+    try std.testing.expect(!SlackChannel.shouldCountSocketFailure(error.ShouldReconnect));
+    try std.testing.expect(SlackChannel.shouldCountSocketFailure(error.SlackApiError));
+    try std.testing.expect(SlackChannel.shouldCountSocketFailure(error.SlackAppTokenRequired));
 }
 
 test "slack channel user allowed wildcard" {
