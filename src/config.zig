@@ -1041,6 +1041,21 @@ test "save roundtrip preserves reliability settings" {
     try std.testing.expectEqualStrings("groq/llama-3.3-70b", loaded.reliability.model_fallbacks[0].fallbacks[1]);
 }
 
+test "json parse memory weights accept integer values" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"vector_weight":1,"keyword_weight":0}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(f64, 1.0), cfg.memory.vector_weight);
+    try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.keyword_weight);
+}
+
 test "save roundtrip preserves extended config sections" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
