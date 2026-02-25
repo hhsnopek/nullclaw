@@ -12,6 +12,7 @@
 //! Uses the existing vector/math.zig for cosine similarity and serialization.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -21,11 +22,9 @@ const embeddings_mod = @import("../vector/embeddings.zig");
 const EmbeddingProvider = embeddings_mod.EmbeddingProvider;
 const log = std.log.scoped(.lancedb_memory);
 
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
-
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const sqlite_mod = if (build_options.enable_sqlite) @import("sqlite.zig") else @import("sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 // ── Config ────────────────────────────────────────────────────────
 
@@ -118,11 +117,10 @@ pub const LanceDbMemory = struct {
         // Set variant bits
         buf[8] = (buf[8] & 0x3f) | 0x80;
         return std.fmt.allocPrint(allocator, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
-            buf[0], buf[1], buf[2],  buf[3],
-            buf[4], buf[5],
-            buf[6], buf[7],
-            buf[8], buf[9],
-            buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            buf[0],  buf[1],  buf[2],  buf[3],
+            buf[4],  buf[5],  buf[6],  buf[7],
+            buf[8],  buf[9],  buf[10], buf[11],
+            buf[12], buf[13], buf[14], buf[15],
         });
     }
 

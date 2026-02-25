@@ -4,12 +4,13 @@
 //! Each test creates its own backend instance, runs the contract, and deinits.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
 const MemoryEntry = root.MemoryEntry;
 
-const SqliteMemory = @import("sqlite.zig").SqliteMemory;
+const SqliteMemory = if (build_options.enable_sqlite) @import("sqlite.zig").SqliteMemory else @import("sqlite_disabled.zig").SqliteMemory;
 const NoneMemory = @import("none.zig").NoneMemory;
 const MarkdownMemory = @import("markdown.zig").MarkdownMemory;
 const InMemoryLruMemory = @import("memory_lru.zig").InMemoryLruMemory;
@@ -212,18 +213,21 @@ fn contractSessionId(m: Memory) !void {
 // ── SQLite tests ─────────────────────────────────────────────────────
 
 test "contract: sqlite basics" {
+    if (!build_options.enable_sqlite) return;
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try contractBasics(mem.memory());
 }
 
 test "contract: sqlite crud" {
+    if (!build_options.enable_sqlite) return;
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try contractCrud(mem.memory());
 }
 
 test "contract: sqlite session_id" {
+    if (!build_options.enable_sqlite) return;
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try contractSessionId(mem.memory());

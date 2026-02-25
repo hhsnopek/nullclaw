@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
@@ -7,11 +8,9 @@ const platform = @import("../platform.zig");
 
 const log = std.log.scoped(.imessage);
 
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
-
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const sqlite_mod = if (build_options.enable_sqlite) @import("../memory/engines/sqlite.zig") else @import("../memory/engines/sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 const CHAT_TARGET_PREFIX = "chat:";
 const POLL_BATCH_LIMIT: c_int = 20;
 
@@ -558,6 +557,8 @@ pub fn isValidChatGuid(chat_guid: []const u8) bool {
 // ════════════════════════════════════════════════════════════════════════════
 
 fn createTestDb(allocator: std.mem.Allocator) ![]u8 {
+    if (!build_options.enable_sqlite and builtin.is_test) return error.SkipZigTest;
+
     const tmp_dir = try platform.getTempDir(allocator);
     defer allocator.free(tmp_dir);
     const filename = try std.fmt.allocPrint(allocator, "nullclaw_imessage_{d}_{x}.db", .{

@@ -131,12 +131,21 @@ const none_backend = BackendDescriptor{
     .create = &createNone,
 };
 
-const base_backends = [_]BackendDescriptor{
+const markdown_backends = if (build_options.enable_memory_markdown) [_]BackendDescriptor{
     markdown_backend,
+} else [0]BackendDescriptor{};
+
+const api_backends = if (build_options.enable_memory_api) [_]BackendDescriptor{
     api_backend,
+} else [0]BackendDescriptor{};
+
+const memory_backends = if (build_options.enable_memory_memory) [_]BackendDescriptor{
     memory_backend,
+} else [0]BackendDescriptor{};
+
+const none_backends = if (build_options.enable_memory_none) [_]BackendDescriptor{
     none_backend,
-};
+} else [0]BackendDescriptor{};
 
 const sqlite_backends = if (build_options.enable_memory_sqlite) [_]BackendDescriptor{
     sqlite_backend,
@@ -164,7 +173,7 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .create = &createPostgres,
 }} else [0]BackendDescriptor{};
 
-pub const all = base_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
+pub const all = markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -333,7 +342,11 @@ fn applyPostgresConnectTimeout(
 // ── Tests ────────────────────────────────────────────────────────
 
 test "registry length" {
-    const expected: usize = 4 +
+    const expected: usize =
+        @as(usize, @intFromBool(build_options.enable_memory_markdown)) +
+        @as(usize, @intFromBool(build_options.enable_memory_api)) +
+        @as(usize, @intFromBool(build_options.enable_memory_memory)) +
+        @as(usize, @intFromBool(build_options.enable_memory_none)) +
         @as(usize, @intFromBool(build_options.enable_memory_sqlite)) +
         @as(usize, @intFromBool(build_options.enable_memory_lucid)) +
         @as(usize, @intFromBool(build_options.enable_memory_redis)) +
@@ -359,6 +372,10 @@ test "findBackend sqlite" {
 }
 
 test "findBackend markdown" {
+    if (!build_options.enable_memory_markdown) {
+        try std.testing.expect(findBackend("markdown") == null);
+        return;
+    }
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("markdown", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -366,6 +383,22 @@ test "findBackend markdown" {
     try std.testing.expect(!desc.needs_db_path);
     try std.testing.expect(desc.needs_workspace);
     try std.testing.expect(desc.auto_save_default);
+}
+
+test "findBackend memory" {
+    if (!build_options.enable_memory_memory) {
+        try std.testing.expect(findBackend("memory") == null);
+        return;
+    }
+    const desc = findBackend("memory") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("memory", desc.name);
+    try std.testing.expect(!desc.capabilities.supports_keyword_rank);
+    try std.testing.expect(!desc.capabilities.supports_session_store);
+    try std.testing.expect(!desc.capabilities.supports_transactions);
+    try std.testing.expect(!desc.capabilities.supports_outbox);
+    try std.testing.expect(!desc.needs_db_path);
+    try std.testing.expect(!desc.needs_workspace);
+    try std.testing.expect(!desc.auto_save_default);
 }
 
 test "findBackend lucid" {
@@ -382,6 +415,10 @@ test "findBackend lucid" {
 }
 
 test "findBackend none" {
+    if (!build_options.enable_memory_none) {
+        try std.testing.expect(findBackend("none") == null);
+        return;
+    }
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("none", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -420,6 +457,10 @@ test "findBackend lancedb" {
 }
 
 test "findBackend api" {
+    if (!build_options.enable_memory_api) {
+        try std.testing.expect(findBackend("api") == null);
+        return;
+    }
     const desc = findBackend("api") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("api", desc.name);
     try std.testing.expect(!desc.capabilities.supports_keyword_rank);
@@ -455,6 +496,10 @@ test "resolvePaths sqlite has db_path" {
 }
 
 test "resolvePaths markdown has no db_path" {
+    if (!build_options.enable_memory_markdown) {
+        try std.testing.expect(findBackend("markdown") == null);
+        return;
+    }
     const desc = findBackend("markdown") orelse return error.TestUnexpectedResult;
     const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
 
@@ -463,6 +508,10 @@ test "resolvePaths markdown has no db_path" {
 }
 
 test "resolvePaths none has no db_path" {
+    if (!build_options.enable_memory_none) {
+        try std.testing.expect(findBackend("none") == null);
+        return;
+    }
     const desc = findBackend("none") orelse return error.TestUnexpectedResult;
     const cfg = try resolvePaths(std.testing.allocator, desc, "/tmp/ws", null, null, null);
 
@@ -471,6 +520,10 @@ test "resolvePaths none has no db_path" {
 }
 
 test "createNone produces working memory" {
+    if (!build_options.enable_memory_none) {
+        try std.testing.expect(findBackend("none") == null);
+        return;
+    }
     const instance = try createNone(std.testing.allocator, .{
         .db_path = null,
         .workspace_dir = "/tmp",
@@ -483,6 +536,10 @@ test "createNone produces working memory" {
 }
 
 test "createNone returns session_store null" {
+    if (!build_options.enable_memory_none) {
+        try std.testing.expect(findBackend("none") == null);
+        return;
+    }
     const instance = try createNone(std.testing.allocator, .{
         .db_path = null,
         .workspace_dir = "/tmp",

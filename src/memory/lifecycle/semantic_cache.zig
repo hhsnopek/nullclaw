@@ -13,15 +13,15 @@
 //! with the vector/embeddings module.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const vector_math = @import("../vector/math.zig");
 const embeddings_mod = @import("../vector/embeddings.zig");
 const EmbeddingProvider = embeddings_mod.EmbeddingProvider;
 
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
-
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 pub const SemanticCache = struct {
     db: ?*c.sqlite3,
@@ -39,6 +39,11 @@ pub const SemanticCache = struct {
         similarity_threshold: f32,
         embedding_provider: ?EmbeddingProvider,
     ) !Self {
+        if (!build_options.enable_sqlite) {
+            if (builtin.is_test) return error.SkipZigTest;
+            return error.SqliteOpenFailed;
+        }
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {

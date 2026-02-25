@@ -5,6 +5,7 @@
 //! retrieval engine, rollout policy, and lifecycle settings.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const registry = @import("../engines/registry.zig");
 const cache_mod = @import("cache.zig");
@@ -270,6 +271,8 @@ test "diagnose with none backend" {
 }
 
 test "diagnose with sqlite backend and entries" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = testing.allocator;
     const impl_ = try allocator.create(root.SqliteMemory);
     errdefer allocator.destroy(impl_);
@@ -311,6 +314,8 @@ test "diagnose with sqlite backend and entries" {
 }
 
 test "diagnose with response cache" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = testing.allocator;
     var setup = try makeTestRuntime(allocator);
 
@@ -340,6 +345,8 @@ test "diagnose with response cache" {
 }
 
 test "diagnose with vector store" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = testing.allocator;
     const sqlite_impl = try allocator.create(root.SqliteMemory);
     errdefer allocator.destroy(sqlite_impl);
@@ -381,6 +388,8 @@ test "diagnose with vector store" {
 }
 
 test "diagnose with outbox" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const allocator = testing.allocator;
     const sqlite_impl = try allocator.create(root.SqliteMemory);
     errdefer allocator.destroy(sqlite_impl);

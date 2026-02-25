@@ -14,14 +14,18 @@ const provider_api_key = @import("../providers/api_key.zig");
 const log = std.log.scoped(.memory);
 
 // engines/ (Layer A: Primary Store)
-pub const sqlite = @import("engines/sqlite.zig");
+pub const sqlite = if (build_options.enable_sqlite) @import("engines/sqlite.zig") else @import("engines/sqlite_disabled.zig");
 pub const markdown = @import("engines/markdown.zig");
 pub const none = @import("engines/none.zig");
 pub const memory_lru = @import("engines/memory_lru.zig");
-pub const lucid = @import("engines/lucid.zig");
+pub const lucid = if (build_options.enable_memory_lucid) @import("engines/lucid.zig") else struct {
+    pub const LucidMemory = struct {};
+};
 pub const postgres = if (build_options.enable_postgres) @import("engines/postgres.zig") else struct {};
 pub const redis = @import("engines/redis.zig");
-pub const lancedb = @import("engines/lancedb.zig");
+pub const lancedb = if (build_options.enable_memory_lancedb) @import("engines/lancedb.zig") else struct {
+    pub const LanceDbMemory = struct {};
+};
 pub const api = @import("engines/api.zig");
 pub const registry = @import("engines/registry.zig");
 
@@ -650,7 +654,7 @@ pub fn initRuntime(
     // ── Lifecycle: response cache ──
     var resp_cache: ?*cache.ResponseCache = null;
     var cache_db_path: ?[*:0]const u8 = null;
-    if (config.response_cache.enabled) blk: {
+    if (build_options.enable_sqlite and config.response_cache.enabled) blk: {
         const cp_slice = std.fs.path.joinZ(allocator, &.{ workspace_dir, "response_cache.db" }) catch break :blk;
         const cp: [*:0]const u8 = cp_slice.ptr;
         const rc = allocator.create(cache.ResponseCache) catch {
@@ -808,6 +812,9 @@ pub fn initRuntime(
                 log.warn("vector store kind 'pgvector' requires build with enable_postgres=true", .{});
                 break :vec_plane;
             }
+        } else if (!build_options.enable_sqlite) {
+            log.warn("vector store kind '{s}' requires build with enable_sqlite=true", .{store_kind});
+            break :vec_plane;
         } else {
             // auto / sqlite_shared / sqlite_sidecar
             const use_shared = std.mem.eql(u8, store_kind, "auto") or std.mem.eql(u8, store_kind, "sqlite_shared");
@@ -930,7 +937,7 @@ pub fn initRuntime(
     // ── Lifecycle: semantic cache ──
     var sem_cache: ?*semantic_cache.SemanticCache = null;
     var sem_cache_db_path: ?[*:0]const u8 = null;
-    if (config.response_cache.enabled and embed_provider != null) sem_cache_blk: {
+    if (build_options.enable_sqlite and config.response_cache.enabled and embed_provider != null) sem_cache_blk: {
         const sc_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "semantic_cache.db" }) catch break :sem_cache_blk;
         const sc = allocator.create(semantic_cache.SemanticCache) catch {
             allocator.free(std.mem.span(sc_path.ptr));
@@ -968,6 +975,7 @@ pub fn initRuntime(
         "keyword";
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
     const vector_mode: []const u8 = if (vs_iface == null) "none" else resolved_vector_mode;
+    const cache_enabled = resp_cache != null;
     log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
         retrieval_mode,
@@ -975,7 +983,7 @@ pub fn initRuntime(
         config.reliability.rollout_mode,
         config.lifecycle.hygiene_enabled,
         config.lifecycle.snapshot_enabled,
-        config.response_cache.enabled,
+        cache_enabled,
         sem_cache != null,
         config.summarizer.enabled,
         source_count,
@@ -997,7 +1005,7 @@ pub fn initRuntime(
             .vector_sync_mode = resolved_vector_sync_mode,
             .hygiene_enabled = config.lifecycle.hygiene_enabled,
             .snapshot_enabled = config.lifecycle.snapshot_enabled,
-            .cache_enabled = config.response_cache.enabled,
+            .cache_enabled = cache_enabled,
             .semantic_cache_enabled = sem_cache != null,
             .summarizer_enabled = config.summarizer.enabled,
             .source_count = source_count,
@@ -1026,12 +1034,14 @@ const c = sqlite.c;
 
 /// Extract the raw sqlite3* handle from a Memory vtable, if the backend is sqlite-based.
 fn extractSqliteDb(mem: Memory) ?*c.sqlite3 {
+    if (!build_options.enable_sqlite) return null;
+
     const name_str = mem.name();
     if (std.mem.eql(u8, name_str, "sqlite")) {
         const impl_: *SqliteMemory = @ptrCast(@alignCast(mem.ptr));
         return impl_.db;
     }
-    if (std.mem.eql(u8, name_str, "lucid")) {
+    if (build_options.enable_memory_lucid and std.mem.eql(u8, name_str, "lucid")) {
         const impl_: *LucidMemory = @ptrCast(@alignCast(mem.ptr));
         return impl_.local.db;
     }
@@ -1262,6 +1272,8 @@ test "initRuntime with cache disabled leaves response_cache null" {
 }
 
 test "initRuntime with cache enabled creates ResponseCache" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "none",
         .response_cache = .{

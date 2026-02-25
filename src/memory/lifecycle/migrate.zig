@@ -4,7 +4,9 @@
 //! and current brain.db variants. Used by migration.zig for SQLite import.
 
 const std = @import("std");
-const sqlite = @import("../engines/sqlite.zig");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const sqlite = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 const c = sqlite.c;
 
 pub const SqliteSourceEntry = struct {
@@ -19,6 +21,7 @@ pub const BrainDbError = error{
     NoContentColumn,
     QueryFailed,
     OutOfMemory,
+    SkipZigTest,
 };
 
 /// Read all entries from a brain.db file. Caller owns returned slice.
@@ -26,6 +29,11 @@ pub fn readBrainDb(
     allocator: std.mem.Allocator,
     db_path: [*:0]const u8,
 ) BrainDbError![]SqliteSourceEntry {
+    if (!build_options.enable_sqlite) {
+        if (builtin.is_test) return error.SkipZigTest;
+        return error.OpenFailed;
+    }
+
     var db: ?*c.sqlite3 = null;
     var rc = c.sqlite3_open_v2(db_path, &db, c.SQLITE_OPEN_READONLY, null);
     if (rc != c.SQLITE_OK) {
@@ -198,6 +206,8 @@ fn columnText(stmt: ?*c.sqlite3_stmt, col: c_int) []const u8 {
 // ── Helper: create in-memory db with schema ────────────────────────
 
 fn createTestDb(allocator: std.mem.Allocator, schema: []const u8) !*c.sqlite3 {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     _ = allocator;
     var db: ?*c.sqlite3 = null;
     const rc = c.sqlite3_open(":memory:", &db);
@@ -268,6 +278,8 @@ test "readBrainDb with minimal schema (content only, others fallback)" {
 }
 
 test "readBrainDb with missing memories table" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     const result = readBrainDb(std.testing.allocator, ":memory:");
     try std.testing.expectError(error.NoMemoriesTable, result);
 }
@@ -434,12 +446,16 @@ test "memory column detection" {
 // ── P5.1: Edge case tests ─────────────────────────────────────────
 
 test "readBrainDb with corrupt file path returns OpenFailed" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     // A null-terminated path to a non-sqlite file
     const result = readBrainDb(std.testing.allocator, "/dev/null");
     try std.testing.expectError(error.NoMemoriesTable, result);
 }
 
 test "readBrainDb with empty table returns empty slice" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     // Create a temp file with an empty memories table
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -470,6 +486,8 @@ test "readBrainDb with empty table returns empty slice" {
 }
 
 test "readBrainDb skips rows with empty content" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -498,6 +516,8 @@ test "readBrainDb skips rows with empty content" {
 }
 
 test "readBrainDb full roundtrip with file-based db" {
+    if (!build_options.enable_sqlite) return error.SkipZigTest;
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

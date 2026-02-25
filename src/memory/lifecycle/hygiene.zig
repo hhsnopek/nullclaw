@@ -7,8 +7,10 @@
 //!   - Prunes old conversation rows from SQLite
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 
 /// Default hygiene interval in seconds (12 hours).
 const HYGIENE_INTERVAL_SECS: i64 = 12 * 60 * 60;
@@ -272,8 +274,9 @@ test "R3: pruneConversationRows with empty NoneMemory returns 0" {
 }
 
 test "R3: pruneConversationRows with sqlite empty store returns 0" {
-    const sqlite = @import("../engines/sqlite.zig");
-    var mem_impl = try sqlite.SqliteMemory.init(std.testing.allocator, ":memory:");
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem_impl.deinit();
     const mem = mem_impl.memory();
 

@@ -5,9 +5,10 @@
 //! shares the database handle with SqliteMemory (memory_embeddings table).
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const vector = @import("math.zig");
-const sqlite_mod = @import("../engines/sqlite.zig");
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 const c = sqlite_mod.c;
 const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 

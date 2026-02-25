@@ -6,11 +6,13 @@
 //!   - should_hydrate: checks if memory is empty but snapshot exists
 
 const std = @import("std");
+const build_options = @import("build_options");
 const root = @import("../root.zig");
 const json_util = @import("../../json_util.zig");
 const Memory = root.Memory;
 const MemoryEntry = root.MemoryEntry;
 const MemoryCategory = root.MemoryCategory;
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 
 /// Default snapshot filename.
 pub const SNAPSHOT_FILENAME = "MEMORY_SNAPSHOT.json";
@@ -151,9 +153,10 @@ test "shouldHydrate no memory no snapshot" {
 }
 
 test "shouldHydrate with non-empty memory" {
+    if (!build_options.enable_sqlite) return;
+
     // Create an in-memory SQLite for test
-    const sqlite = @import("../engines/sqlite.zig");
-    var mem_impl = try sqlite.SqliteMemory.init(std.testing.allocator, ":memory:");
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem_impl.deinit();
     const mem = mem_impl.memory();
 
@@ -165,8 +168,9 @@ test "shouldHydrate with non-empty memory" {
 }
 
 test "exportSnapshot returns zero for empty memory" {
-    const sqlite = @import("../engines/sqlite.zig");
-    var mem_impl = try sqlite.SqliteMemory.init(std.testing.allocator, ":memory:");
+    if (!build_options.enable_sqlite) return;
+
+    var mem_impl = try sqlite_mod.SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem_impl.deinit();
     const mem = mem_impl.memory();
 
@@ -181,7 +185,8 @@ test "SNAPSHOT_FILENAME is correct" {
 // ── R3 Tests ──────────────────────────────────────────────────────
 
 test "R3: snapshot export then import roundtrip preserves all entries" {
-    const sqlite_mod = @import("../engines/sqlite.zig");
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -232,7 +237,8 @@ test "R3: snapshot export then import roundtrip preserves all entries" {
 }
 
 test "R3: shouldHydrate returns true when memory is empty and snapshot exists" {
-    const sqlite_mod = @import("../engines/sqlite.zig");
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -252,7 +258,8 @@ test "R3: shouldHydrate returns true when memory is empty and snapshot exists" {
 }
 
 test "R3: hydrateFromSnapshot with no file returns 0" {
-    const sqlite_mod = @import("../engines/sqlite.zig");
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
 
     var mem_impl = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");

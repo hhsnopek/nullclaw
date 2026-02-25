@@ -5,6 +5,7 @@
 //! PrimaryAdapter (wraps Memory.recall), RetrievalEngine.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -20,6 +21,7 @@ const mmr_mod = @import("mmr.zig");
 const query_expansion_mod = @import("query_expansion.zig");
 const adaptive_mod = @import("adaptive.zig");
 const llm_reranker_mod = @import("llm_reranker.zig");
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
 const log = std.log.scoped(.retrieval);
 
 // ── Pipeline stage ordering ──────────────────────────────────────
@@ -662,10 +664,18 @@ fn shrinkAlloc(allocator: Allocator, slice: []RetrievalCandidate, new_len: usize
             // Both realloc and alloc failed — extremely unlikely.
             // Zero the deinit'd tail to prevent double-free if caller iterates full slice.
             const zero: RetrievalCandidate = .{
-                .id = "", .key = "", .content = "", .snippet = "",
-                .category = .core, .keyword_rank = null, .vector_score = null,
-                .final_score = 0.0, .source = "", .source_path = "",
-                .start_line = 0, .end_line = 0,
+                .id = "",
+                .key = "",
+                .content = "",
+                .snippet = "",
+                .category = .core,
+                .keyword_rank = null,
+                .vector_score = null,
+                .final_score = 0.0,
+                .source = "",
+                .source_path = "",
+                .start_line = 0,
+                .end_line = 0,
             };
             for (slice[new_len..]) |*s| s.* = zero;
             return slice;
@@ -821,8 +831,9 @@ test "PrimaryAdapter healthCheck delegates" {
 }
 
 test "PrimaryAdapter.keywordCandidates converts MemoryEntry correctly" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -845,8 +856,9 @@ test "PrimaryAdapter.keywordCandidates converts MemoryEntry correctly" {
 }
 
 test "PrimaryAdapter keyword_rank is 1-based sequential" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -877,8 +889,9 @@ test "RetrievalEngine.init with defaults" {
 }
 
 test "Engine.search with single primary source" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -913,8 +926,9 @@ test "Engine.search with empty results returns empty" {
 }
 
 test "Engine.search applies min_score filter" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -935,8 +949,9 @@ test "Engine.search applies min_score filter" {
 }
 
 test "Engine.search applies top_k truncation" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -984,8 +999,9 @@ test "Engine with no sources returns empty" {
 }
 
 test "entriesToCandidates converts correctly" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();
@@ -1003,8 +1019,9 @@ test "entriesToCandidates converts correctly" {
 }
 
 test "regression anchor: Engine with PrimaryAdapter matches raw recall order" {
+    if (!build_options.enable_sqlite) return;
+
     const allocator = std.testing.allocator;
-    const sqlite_mod = @import("../engines/sqlite.zig");
     var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
     defer db.deinit();
     const mem = db.memory();

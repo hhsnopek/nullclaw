@@ -5,11 +5,11 @@
 //! TTL. The cache is optional and disabled by default.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
-
-const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const sqlite_mod = if (build_options.enable_sqlite) @import("../engines/sqlite.zig") else @import("../engines/sqlite_disabled.zig");
+const c = sqlite_mod.c;
+const SQLITE_STATIC = sqlite_mod.SQLITE_STATIC;
 
 pub const ResponseCache = struct {
     db: ?*c.sqlite3,
@@ -19,6 +19,11 @@ pub const ResponseCache = struct {
     const Self = @This();
 
     pub fn init(db_path: [*:0]const u8, ttl_minutes: u32, max_entries: usize) !Self {
+        if (!build_options.enable_sqlite) {
+            if (builtin.is_test) return error.SkipZigTest;
+            return error.SqliteOpenFailed;
+        }
+
         var db: ?*c.sqlite3 = null;
         const rc = c.sqlite3_open(db_path, &db);
         if (rc != c.SQLITE_OK) {
