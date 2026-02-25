@@ -604,7 +604,20 @@ pub fn initRuntime(
     workspace_dir: []const u8,
 ) ?MemoryRuntime {
     const desc = registry.findBackend(config.backend) orelse {
-        log.warn("unknown memory backend '{s}' — check config.memory.backend", .{config.backend});
+        const enabled_backends = registry.formatEnabledBackends(allocator) catch null;
+        defer if (enabled_backends) |names| allocator.free(names);
+
+        if (registry.isKnownBackend(config.backend)) {
+            const engine_token = registry.engineTokenForBackend(config.backend) orelse config.backend;
+            log.warn("memory backend '{s}' is configured but disabled in this build", .{config.backend});
+            log.warn("rebuild with -Dengines={s} (or include it in your -Dengines=... list)", .{engine_token});
+        } else {
+            log.warn("unknown memory backend '{s}' — check config.memory.backend", .{config.backend});
+            log.warn("known memory backends: {s}", .{registry.known_backends_csv});
+        }
+        if (enabled_backends) |names| {
+            log.warn("enabled memory backends in this build: {s}", .{names});
+        }
         return null;
     };
 

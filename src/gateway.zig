@@ -1349,6 +1349,12 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_telegram) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"telegram channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";
@@ -1432,6 +1438,12 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_whatsapp) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"whatsapp channel disabled in this build\"}";
+        return;
+    }
+
     const is_get = std.mem.eql(u8, ctx.method, "GET");
     if (is_get) {
         const mode = parseQueryParam(ctx.target, "hub.mode");
@@ -1616,6 +1628,12 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_slack) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"slack channel disabled in this build\"}";
+        return;
+    }
+
     if (!std.mem.eql(u8, ctx.method, "POST")) {
         ctx.response_status = "405 Method Not Allowed";
         ctx.response_body = "{\"error\":\"method not allowed\"}";
@@ -1829,6 +1847,12 @@ fn linePeerMetadata(evt: channels.line.LineEvent, peer_buf: []u8) struct {
 }
 
 fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_line) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"line channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";
@@ -1943,6 +1967,12 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
 }
 
 fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_lark) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"lark channel disabled in this build\"}";
+        return;
+    }
+
     const is_post = std.mem.eql(u8, ctx.method, "POST");
     if (!is_post) {
         ctx.response_status = "405 Method Not Allowed";

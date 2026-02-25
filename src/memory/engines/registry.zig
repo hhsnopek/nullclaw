@@ -174,6 +174,18 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
 }} else [0]BackendDescriptor{};
 
 pub const all = markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
+pub const known_backend_names = [_][]const u8{
+    "none",
+    "markdown",
+    "memory",
+    "api",
+    "sqlite",
+    "lucid",
+    "redis",
+    "lancedb",
+    "postgres",
+};
+pub const known_backends_csv = "none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres";
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -182,6 +194,41 @@ pub fn findBackend(name: []const u8) ?*const BackendDescriptor {
         if (std.mem.eql(u8, desc.name, name)) return desc;
     }
     return null;
+}
+
+pub fn isKnownBackend(name: []const u8) bool {
+    for (known_backend_names) |known| {
+        if (std.mem.eql(u8, known, name)) return true;
+    }
+    return false;
+}
+
+pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "none")) return "none";
+    if (std.mem.eql(u8, name, "markdown")) return "markdown";
+    if (std.mem.eql(u8, name, "memory")) return "memory";
+    if (std.mem.eql(u8, name, "api")) return "api";
+    if (std.mem.eql(u8, name, "sqlite")) return "sqlite";
+    if (std.mem.eql(u8, name, "lucid")) return "lucid";
+    if (std.mem.eql(u8, name, "redis")) return "redis";
+    if (std.mem.eql(u8, name, "lancedb")) return "lancedb";
+    if (std.mem.eql(u8, name, "postgres")) return "postgres";
+    return null;
+}
+
+pub fn formatEnabledBackends(allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+
+    for (&all, 0..) |desc, i| {
+        if (i != 0) try w.writeAll(", ");
+        try w.writeAll(desc.name);
+    }
+    if (all.len == 0) {
+        try w.writeAll("(none)");
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 // ── Path resolver ────────────────────────────────────────────────
@@ -478,6 +525,34 @@ test "findBackend unknown returns null" {
 
 test "findBackend empty returns null" {
     try std.testing.expect(findBackend("") == null);
+}
+
+test "isKnownBackend validates canonical backend names" {
+    for (known_backend_names) |name| {
+        try std.testing.expect(isKnownBackend(name));
+    }
+    try std.testing.expect(!isKnownBackend("unknown_backend"));
+}
+
+test "engineTokenForBackend maps known names and rejects unknown" {
+    try std.testing.expectEqualStrings("none", engineTokenForBackend("none").?);
+    try std.testing.expectEqualStrings("markdown", engineTokenForBackend("markdown").?);
+    try std.testing.expectEqualStrings("sqlite", engineTokenForBackend("sqlite").?);
+    try std.testing.expectEqualStrings("postgres", engineTokenForBackend("postgres").?);
+    try std.testing.expect(engineTokenForBackend("unknown_backend") == null);
+}
+
+test "formatEnabledBackends reflects compiled registry" {
+    const rendered = try formatEnabledBackends(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+
+    if (all.len == 0) {
+        try std.testing.expectEqualStrings("(none)", rendered);
+        return;
+    }
+    for (&all) |desc| {
+        try std.testing.expect(std.mem.indexOf(u8, rendered, desc.name) != null);
+    }
 }
 
 test "resolvePaths sqlite has db_path" {

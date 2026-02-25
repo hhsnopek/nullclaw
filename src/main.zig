@@ -640,6 +640,26 @@ fn parsePositiveUsize(arg: []const u8) ?usize {
     return n;
 }
 
+fn printMemoryRuntimeInitFailure(allocator: std.mem.Allocator, backend: []const u8) void {
+    const enabled = yc.memory.registry.formatEnabledBackends(allocator) catch null;
+    defer if (enabled) |names| allocator.free(names);
+
+    if (yc.memory.registry.isKnownBackend(backend) and yc.memory.findBackend(backend) == null) {
+        const engine_token = yc.memory.registry.engineTokenForBackend(backend) orelse backend;
+        std.debug.print("Memory backend '{s}' is configured but disabled in this build.\n", .{backend});
+        std.debug.print("Rebuild with -Dengines={s} (or include it in -Dengines=... list).\n", .{engine_token});
+    } else if (!yc.memory.registry.isKnownBackend(backend)) {
+        std.debug.print("Unknown memory backend '{s}'.\n", .{backend});
+        std.debug.print("Known memory backends: {s}\n", .{yc.memory.registry.known_backends_csv});
+    } else {
+        std.debug.print("Memory runtime init failed for backend '{s}'. Check memory config and logs.\n", .{backend});
+    }
+
+    if (enabled) |names| {
+        std.debug.print("Enabled memory backends in this build: {s}\n", .{names});
+    }
+}
+
 fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
     const kw_rank: []const u8 = if (c.keyword_rank != null) "yes" else "no";
     const vec_score: f32 = c.vector_score orelse -1.0;
@@ -672,7 +692,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     defer cfg.deinit();
 
     var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
-        std.debug.print("Memory runtime init failed. Check memory config and logs.\n", .{});
+        printMemoryRuntimeInitFailure(allocator, cfg.memory.backend);
         std.process.exit(1);
     };
     defer mem_rt.deinit();
@@ -997,6 +1017,7 @@ fn dispatchChannelStart(
 ) !void {
     if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
         std.debug.print("{s} channel is disabled in this build.\n", .{meta.label});
+        std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
         std.process.exit(1);
     }
 
@@ -1034,6 +1055,46 @@ fn hasConfiguredStartableChannels(config: *const yc.config.Config) bool {
     return false;
 }
 
+fn hasConfiguredButBuildDisabledStartableChannels(config: *const yc.config.Config) bool {
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) > 0) return true;
+    }
+    return false;
+}
+
+fn printConfiguredButBuildDisabledChannelsHint(config: *const yc.config.Config) void {
+    std.debug.print("Configured channels are disabled in this build:", .{});
+    var first: bool = true;
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) == 0) continue;
+        if (first) {
+            std.debug.print(" {s}", .{meta.key});
+            first = false;
+        } else {
+            std.debug.print(", {s}", .{meta.key});
+        }
+    }
+    std.debug.print("\n", .{});
+    std.debug.print("Rebuild with -Dchannels=all or -Dchannels=", .{});
+    first = true;
+    for (yc.channel_catalog.known_channels) |meta| {
+        if (meta.id == .cli or meta.id == .webhook) continue;
+        if (yc.channel_catalog.isBuildEnabled(meta.id)) continue;
+        if (yc.channel_catalog.configuredCount(config, meta.id) == 0) continue;
+        if (first) {
+            std.debug.print("{s}", .{meta.key});
+            first = false;
+        } else {
+            std.debug.print(",{s}", .{meta.key});
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 fn printNoMessagingChannelConfiguredHint() void {
     std.debug.print("No messaging channel configured. Add to config.json:\n", .{});
     std.debug.print("  Telegram: {{\"channels\": {{\"telegram\": {{\"accounts\": {{\"main\": {{\"bot_token\": \"...\"}}}}}}}}\n", .{});
@@ -1059,7 +1120,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
     };
 
     if (!hasConfiguredStartableChannels(&config)) {
-        printNoMessagingChannelConfiguredHint();
+        if (hasConfiguredButBuildDisabledStartableChannels(&config)) {
+            printConfiguredButBuildDisabledChannelsHint(&config);
+        } else {
+            printNoMessagingChannelConfiguredHint();
+        }
         std.process.exit(1);
     }
 
@@ -1073,7 +1138,13 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
             std.process.exit(1);
         };
         if (!yc.channel_catalog.isBuildEnabled(meta.id)) {
-            std.debug.print("Channel {s} is disabled in this build.\n", .{ch_name});
+            const configured = yc.channel_catalog.configuredCount(&config, meta.id);
+            if (configured > 0) {
+                std.debug.print("Channel {s} is configured ({d} account(s)) but disabled in this build.\n", .{ meta.key, configured });
+            } else {
+                std.debug.print("Channel {s} is disabled in this build.\n", .{meta.key});
+            }
+            std.debug.print("Rebuild with -Dchannels={s} (or -Dchannels=all).\n", .{meta.key});
             printChannelStartSupported();
             std.process.exit(1);
         }
@@ -2198,4 +2269,20 @@ test "hasConfiguredStartableChannels returns true when telegram configured" {
     };
 
     try std.testing.expect(hasConfiguredStartableChannels(&cfg));
+}
+
+test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled channel" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &[_]yc.config.TelegramConfig{
+                .{ .account_id = "main", .bot_token = "123:abc" },
+            },
+        },
+    };
+
+    try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
 }
