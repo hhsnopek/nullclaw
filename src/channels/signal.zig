@@ -541,35 +541,44 @@ pub const SignalChannel = struct {
         };
     }
 
-    /// Send a message via JSON-RPC to the signal-cli daemon.
-    /// Parses [IMAGE:path] markers from message text and sends as attachments.
-    pub fn sendMessage(self: *SignalChannel, target_str: []const u8, message: []const u8, media: []const []const u8) !void {
-        if (builtin.is_test) return;
+    const PreparedOutgoingContent = struct {
+        message_text: []const u8,
+        attachments: [][]const u8,
 
-        const target = parseRecipientTarget(target_str);
+        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            allocator.free(self.message_text);
+            for (self.attachments) |path| allocator.free(path);
+            allocator.free(self.attachments);
+        }
+    };
 
-        // Parse [IMAGE:path] markers from message text
+    const OutgoingPayload = struct {
+        message: ?[]const u8,
+        attachment_index: ?usize = null,
+    };
+
+    fn prepareOutgoingContent(self: *SignalChannel, message: []const u8, media: []const []const u8) !PreparedOutgoingContent {
         const parsed = try parseImageMarkers(self.allocator, message);
+        errdefer self.allocator.free(parsed.remaining);
         defer {
             for (parsed.paths) |p| self.allocator.free(p);
             self.allocator.free(parsed.paths);
-            self.allocator.free(parsed.remaining);
         }
 
-        // Combine explicitly passed media with parsed markers
+        // Combine explicitly passed media with parsed markers.
         var all_media: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (all_media.items) |m| self.allocator.free(m);
             all_media.deinit(self.allocator);
         }
 
-        // Add explicitly passed media first (convert to absolute paths)
+        // Add explicitly passed media first (convert to absolute paths).
         for (media) |m| {
             const abs_path = try resolveAttachmentPath(self.allocator, m);
             try all_media.append(self.allocator, abs_path);
         }
 
-        // Add parsed image paths (avoid duplicates, convert to absolute)
+        // Add parsed image paths (avoid duplicates, convert to absolute).
         for (parsed.paths) |p| {
             const abs_path = try resolveAttachmentPath(self.allocator, p);
             var found = false;
@@ -586,79 +595,85 @@ pub const SignalChannel = struct {
             }
         }
 
-        const final_media = try all_media.toOwnedSlice(self.allocator);
-        defer {
-            for (final_media) |m| self.allocator.free(m);
-            self.allocator.free(final_media);
+        return .{
+            .message_text = parsed.remaining,
+            .attachments = try all_media.toOwnedSlice(self.allocator),
+        };
+    }
+
+    fn planOutgoingPayloads(
+        allocator: std.mem.Allocator,
+        message_text: []const u8,
+        attachment_count: usize,
+    ) ![]OutgoingPayload {
+        var payloads: std.ArrayListUnmanaged(OutgoingPayload) = .empty;
+        errdefer payloads.deinit(allocator);
+
+        if (attachment_count == 0) {
+            if (message_text.len == 0) return try allocator.alloc(OutgoingPayload, 0);
+
+            var text_iter = root.splitMessage(message_text, MAX_MESSAGE_LEN);
+            while (text_iter.next()) |chunk| {
+                try payloads.append(allocator, .{ .message = chunk });
+            }
+            return try payloads.toOwnedSlice(allocator);
         }
 
-        // If no text but have attachments, send each with full path as message
-        if (final_media.len > 0 and parsed.remaining.len == 0) {
-            for (final_media) |att| {
-                const rpc_body = try self.buildRpcBody(self.allocator, "send", target, att, &.{att});
-                defer self.allocator.free(rpc_body);
-
-                var url_buf: [1024]u8 = undefined;
-                const url = try self.rpcUrl(&url_buf);
-
-                const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
-                    log.warn("Signal RPC send failed: {}", .{err});
-                    return err;
-                };
-                self.allocator.free(resp);
+        if (message_text.len > 0) {
+            var text_iter = root.splitMessage(message_text, MAX_MESSAGE_LEN);
+            while (text_iter.next()) |chunk| {
+                try payloads.append(allocator, .{ .message = chunk });
             }
-            return;
         }
 
-        // If we have both text and attachments, send text first then attachment with path
-        if (final_media.len > 0 and parsed.remaining.len > 0) {
-            // Send text message first (no attachments)
-            var iter = root.splitMessage(parsed.remaining, MAX_MESSAGE_LEN);
-            while (iter.next()) |chunk| {
-                const rpc_body = try self.buildRpcBody(self.allocator, "send", target, chunk, &.{});
-                defer self.allocator.free(rpc_body);
-
-                var url_buf: [1024]u8 = undefined;
-                const url = try self.rpcUrl(&url_buf);
-
-                const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
-                    log.warn("Signal RPC send failed: {}", .{err});
-                    return err;
-                };
-                self.allocator.free(resp);
-            }
-
-            // Then send attachments with path as message
-            for (final_media) |att| {
-                const rpc_body = try self.buildRpcBody(self.allocator, "send", target, att, &.{att});
-                defer self.allocator.free(rpc_body);
-
-                var url_buf: [1024]u8 = undefined;
-                const url = try self.rpcUrl(&url_buf);
-
-                const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
-                    log.warn("Signal RPC send failed: {}", .{err});
-                    return err;
-                };
-                self.allocator.free(resp);
-            }
-            return;
+        var i: usize = 0;
+        while (i < attachment_count) : (i += 1) {
+            try payloads.append(allocator, .{
+                .message = null,
+                .attachment_index = i,
+            });
         }
 
-        // Text only (no attachments)
-        var iter = root.splitMessage(parsed.remaining, MAX_MESSAGE_LEN);
-        while (iter.next()) |chunk| {
-            const rpc_body = try self.buildRpcBody(self.allocator, "send", target, chunk, final_media);
-            defer self.allocator.free(rpc_body);
+        return try payloads.toOwnedSlice(allocator);
+    }
 
-            var url_buf: [1024]u8 = undefined;
-            const url = try self.rpcUrl(&url_buf);
+    fn sendRpcPayload(
+        self: *SignalChannel,
+        target: RecipientTarget,
+        message: ?[]const u8,
+        attachments: []const []const u8,
+    ) !void {
+        const rpc_body = try self.buildRpcBody(self.allocator, "send", target, message, attachments);
+        defer self.allocator.free(rpc_body);
 
-            const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
-                log.warn("Signal RPC send failed: {}", .{err});
-                return err;
-            };
-            self.allocator.free(resp);
+        var url_buf: [1024]u8 = undefined;
+        const url = try self.rpcUrl(&url_buf);
+
+        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
+            log.warn("Signal RPC send failed: {}", .{err});
+            return err;
+        };
+        self.allocator.free(resp);
+    }
+
+    /// Send a message via JSON-RPC to the signal-cli daemon.
+    /// Parses [IMAGE:path] markers from message text and sends as attachments.
+    pub fn sendMessage(self: *SignalChannel, target_str: []const u8, message: []const u8, media: []const []const u8) !void {
+        if (builtin.is_test) return;
+
+        const target = parseRecipientTarget(target_str);
+        const prepared = try self.prepareOutgoingContent(message, media);
+        defer prepared.deinit(self.allocator);
+
+        const payloads = try planOutgoingPayloads(self.allocator, prepared.message_text, prepared.attachments.len);
+        defer self.allocator.free(payloads);
+
+        for (payloads) |payload| {
+            const attachments: []const []const u8 = if (payload.attachment_index) |idx|
+                prepared.attachments[idx .. idx + 1]
+            else
+                &.{};
+            try self.sendRpcPayload(target, payload.message, attachments);
         }
     }
 
@@ -1594,6 +1609,96 @@ test "build rpc body with single attachment" {
     const body = try ch.buildRpcBody(std.testing.allocator, "send", .{ .direct = "+5555555555" }, "Photo!", attachments);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"attachments\":[\"/tmp/photo.jpg\"]") != null);
+}
+
+test "parse image markers extracts paths and strips markers from text" {
+    const parsed = try SignalChannel.parseImageMarkers(
+        std.testing.allocator,
+        "Look [IMAGE:/tmp/a.png] and [IMAGE:/tmp/b.jpg] now",
+    );
+    defer {
+        for (parsed.paths) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(parsed.paths);
+        std.testing.allocator.free(parsed.remaining);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.paths.len);
+    try std.testing.expectEqualStrings("/tmp/a.png", parsed.paths[0]);
+    try std.testing.expectEqualStrings("/tmp/b.jpg", parsed.paths[1]);
+    try std.testing.expectEqualStrings("Look and now", parsed.remaining);
+}
+
+test "prepare outgoing content merges media and deduplicates paths" {
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+
+    const prepared = try ch.prepareOutgoingContent(
+        "See [IMAGE:/tmp/a.png] and [IMAGE:/tmp/a.png]",
+        &[_][]const u8{ "/tmp/b.png", "/tmp/a.png" },
+    );
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("See and", prepared.message_text);
+    try std.testing.expectEqual(@as(usize, 2), prepared.attachments.len);
+    try std.testing.expectEqualStrings("/tmp/b.png", prepared.attachments[0]);
+    try std.testing.expectEqualStrings("/tmp/a.png", prepared.attachments[1]);
+}
+
+test "prepare outgoing content keeps unresolved relative attachment path" {
+    var ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+
+    const marker_text = "[IMAGE:nullclaw_nonexistent_attachment_123456789.png]";
+    const prepared = try ch.prepareOutgoingContent(marker_text, &.{});
+    defer prepared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("", prepared.message_text);
+    try std.testing.expectEqual(@as(usize, 1), prepared.attachments.len);
+    try std.testing.expectEqualStrings("nullclaw_nonexistent_attachment_123456789.png", prepared.attachments[0]);
+}
+
+test "plan outgoing payloads sends attachment payloads without text" {
+    const payloads = try SignalChannel.planOutgoingPayloads(std.testing.allocator, "hello", 2);
+    defer std.testing.allocator.free(payloads);
+
+    try std.testing.expectEqual(@as(usize, 3), payloads.len);
+    try std.testing.expectEqualStrings("hello", payloads[0].message.?);
+    try std.testing.expect(payloads[0].attachment_index == null);
+    try std.testing.expect(payloads[1].message == null);
+    try std.testing.expectEqual(@as(usize, 0), payloads[1].attachment_index.?);
+    try std.testing.expect(payloads[2].message == null);
+    try std.testing.expectEqual(@as(usize, 1), payloads[2].attachment_index.?);
+}
+
+test "plan outgoing payloads splits text-only messages" {
+    const long_text = try std.testing.allocator.alloc(u8, MAX_MESSAGE_LEN + 5);
+    defer std.testing.allocator.free(long_text);
+    @memset(long_text, 'a');
+
+    const payloads = try SignalChannel.planOutgoingPayloads(std.testing.allocator, long_text, 0);
+    defer std.testing.allocator.free(payloads);
+
+    try std.testing.expectEqual(@as(usize, 2), payloads.len);
+    try std.testing.expect(payloads[0].message != null);
+    try std.testing.expectEqual(@as(usize, MAX_MESSAGE_LEN), payloads[0].message.?.len);
+    try std.testing.expect(payloads[1].message != null);
+    try std.testing.expectEqual(@as(usize, 5), payloads[1].message.?.len);
+    try std.testing.expect(payloads[0].attachment_index == null);
+    try std.testing.expect(payloads[1].attachment_index == null);
 }
 
 // ── Process Envelope Tests ──────────────────────────────────────────
