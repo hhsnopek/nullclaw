@@ -13,6 +13,9 @@ pub const CircuitBreaker = struct {
     threshold: u32,
     cooldown_ns: u64,
     last_failure_ns: i128,
+    /// Guards half_open to allow exactly one probe request before requiring
+    /// recordSuccess/recordFailure.
+    half_open_probe_sent: bool = false,
 
     pub fn init(threshold: u32, cooldown_ms: u32) CircuitBreaker {
         return .{
@@ -21,10 +24,13 @@ pub const CircuitBreaker = struct {
             .threshold = threshold,
             .cooldown_ns = @as(u64, cooldown_ms) * 1_000_000,
             .last_failure_ns = 0,
+            .half_open_probe_sent = false,
         };
     }
 
     /// Can we attempt an operation? Returns true if closed or half_open (cooldown expired).
+    /// In half_open state, only the first call returns true (single probe request).
+    /// Subsequent calls return false until recordSuccess/recordFailure is called.
     pub fn allow(self: *CircuitBreaker) bool {
         switch (self.state) {
             .closed => return true,
@@ -32,11 +38,19 @@ pub const CircuitBreaker = struct {
                 const now = std.time.nanoTimestamp();
                 if (now - self.last_failure_ns >= self.cooldown_ns) {
                     self.state = .half_open;
+                    self.half_open_probe_sent = true;
                     return true;
                 }
                 return false;
             },
-            .half_open => return true,
+            .half_open => {
+                // Only allow one probe request in half_open state.
+                if (!self.half_open_probe_sent) {
+                    self.half_open_probe_sent = true;
+                    return true;
+                }
+                return false;
+            },
         }
     }
 
@@ -44,6 +58,7 @@ pub const CircuitBreaker = struct {
     pub fn recordSuccess(self: *CircuitBreaker) void {
         self.state = .closed;
         self.failure_count = 0;
+        self.half_open_probe_sent = false;
     }
 
     /// Record failed operation. Increments counter, trips to open at threshold.
@@ -53,6 +68,7 @@ pub const CircuitBreaker = struct {
 
         if (self.state == .half_open or (self.state == .closed and self.failure_count >= self.threshold)) {
             self.state = .open;
+            self.half_open_probe_sent = false;
         }
     }
 
@@ -186,4 +202,30 @@ test "threshold zero trips immediately on first failure" {
     cb.recordFailure(); // failure_count=1 >= threshold=0 → open
     try std.testing.expectEqual(State.open, cb.state);
     try std.testing.expect(cb.isOpen());
+}
+
+test "half_open allows exactly one probe request" {
+    var cb = CircuitBreaker.init(1, 0);
+    cb.recordFailure(); // → open
+    try std.testing.expect(cb.allow()); // → half_open, first probe allowed
+    try std.testing.expectEqual(State.half_open, cb.state);
+    // Second call in half_open must be rejected (only one probe)
+    try std.testing.expect(!cb.allow());
+    try std.testing.expectEqual(State.half_open, cb.state);
+    // After recordSuccess, should be closed again and allow normally
+    cb.recordSuccess();
+    try std.testing.expectEqual(State.closed, cb.state);
+    try std.testing.expect(cb.allow());
+}
+
+test "half_open probe resets after failure cycle" {
+    var cb = CircuitBreaker.init(1, 0);
+    cb.recordFailure(); // → open
+    try std.testing.expect(cb.allow()); // → half_open, probe sent
+    try std.testing.expect(!cb.allow()); // blocked
+    cb.recordFailure(); // → open again, probe_sent reset
+    try std.testing.expectEqual(State.open, cb.state);
+    // After cooldown expires again, a new probe should be allowed
+    try std.testing.expect(cb.allow()); // → half_open, new probe
+    try std.testing.expectEqual(State.half_open, cb.state);
 }

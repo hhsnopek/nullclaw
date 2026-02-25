@@ -623,12 +623,23 @@ pub const RetrievalEngine = struct {
 
 /// Filter candidates below min_score threshold.
 /// Returns the (possibly shrunk) slice. Filtered entries are deinited.
+/// NaN scores are always filtered out regardless of min_score.
 fn applyMinRelevance(allocator: Allocator, candidates: []RetrievalCandidate, min_score: f64) []RetrievalCandidate {
-    if (min_score <= 0.0) return candidates;
+    // Even with min_score <= 0, scan for NaN scores to prevent propagation
+    var has_nan = false;
+    if (min_score <= 0.0) {
+        for (candidates) |ca| {
+            if (std.math.isNan(ca.final_score)) {
+                has_nan = true;
+                break;
+            }
+        }
+        if (!has_nan) return candidates;
+    }
 
     var keep: usize = 0;
     for (candidates, 0..) |*ca, idx| {
-        if (ca.final_score >= min_score) {
+        if (!std.math.isNan(ca.final_score) and ca.final_score >= min_score) {
             if (keep != idx) {
                 candidates[keep] = ca.*;
             }
@@ -649,8 +660,14 @@ fn shrinkAlloc(allocator: Allocator, slice: []RetrievalCandidate, new_len: usize
     return allocator.realloc(slice, new_len) catch blk: {
         const fresh = allocator.alloc(RetrievalCandidate, new_len) catch {
             // Both realloc and alloc failed — extremely unlikely.
-            // Return original slice; caller iterates extra deinited slots
-            // but this is the only safe option without leaking or UB.
+            // Zero the deinit'd tail to prevent double-free if caller iterates full slice.
+            const zero: RetrievalCandidate = .{
+                .id = "", .key = "", .content = "", .snippet = "",
+                .category = .core, .keyword_rank = null, .vector_score = null,
+                .final_score = 0.0, .source = "", .source_path = "",
+                .start_line = 0, .end_line = 0,
+            };
+            for (slice[new_len..]) |*s| s.* = zero;
             return slice;
         };
         @memcpy(fresh, slice[0..new_len]);
@@ -688,7 +705,7 @@ fn vectorResultsToCandidates(allocator: Allocator, vec_results: []const vector_s
             .key = key,
             .content = content,
             .snippet = snippet,
-            .category = .core,
+            .category = .daily, // Not .core — vector results should be subject to temporal decay
             .keyword_rank = null,
             .vector_score = vr.score,
             .final_score = 0.0,

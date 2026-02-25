@@ -27,6 +27,7 @@ pub const channel_loop = @import("channel_loop.zig");
 pub const channel_manager = @import("channel_manager.zig");
 pub const channel_catalog = @import("channel_catalog.zig");
 pub const migration = @import("migration.zig");
+pub const sse_client = @import("sse_client.zig");
 pub const update = @import("update.zig");
 
 // Phase 2: Agent core

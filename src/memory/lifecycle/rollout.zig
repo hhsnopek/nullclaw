@@ -37,8 +37,8 @@ pub const RolloutPolicy = struct {
     pub fn init(reliability_cfg: config_types.MemoryReliabilityConfig) RolloutPolicy {
         return .{
             .mode = RolloutMode.fromString(reliability_cfg.rollout_mode),
-            .canary_percent = reliability_cfg.canary_hybrid_percent,
-            .shadow_percent = reliability_cfg.shadow_hybrid_percent,
+            .canary_percent = @min(reliability_cfg.canary_hybrid_percent, 100),
+            .shadow_percent = @min(reliability_cfg.shadow_hybrid_percent, 100),
         };
     }
 

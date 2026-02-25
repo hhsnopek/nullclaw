@@ -511,6 +511,11 @@ pub const MemoryRuntime = struct {
     }
 
     pub fn deinit(self: *MemoryRuntime) void {
+        // Best-effort: drain any pending vector sync operations before teardown.
+        // Must happen while embedding provider, vector store, and circuit breaker
+        // are still alive (drainOutbox uses all three).
+        _ = self.drainOutbox(self._allocator);
+
         // Engine first: it holds references to P3 components (vector store,
         // embedding provider, circuit breaker) — must deinit before them.
         if (self._engine) |engine| {

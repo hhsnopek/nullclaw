@@ -154,6 +154,20 @@ pub const SemanticCache = struct {
         }
         defer if (embedding_json) |ej| allocator.free(ej);
 
+        // Remove prior entries for this exact hash to prevent unbounded accumulation.
+        // Unlike ResponseCache (which uses INSERT OR REPLACE on a UNIQUE key), semantic_cache
+        // uses an auto-increment id, so we must delete explicitly.
+        {
+            const del_sql = "DELETE FROM semantic_cache WHERE prompt_hash = ?1";
+            var del_stmt: ?*c.sqlite3_stmt = null;
+            const del_rc = c.sqlite3_prepare_v2(self.db, del_sql, -1, &del_stmt, null);
+            if (del_rc == c.SQLITE_OK) {
+                defer _ = c.sqlite3_finalize(del_stmt);
+                _ = c.sqlite3_bind_text(del_stmt, 1, key_hex.ptr, @intCast(key_hex.len), SQLITE_STATIC);
+                _ = c.sqlite3_step(del_stmt);
+            }
+        }
+
         const sql =
             "INSERT INTO semantic_cache " ++
             "(prompt_hash, model, response, token_count, embedding, created_at, accessed_at, hit_count) " ++
@@ -571,4 +585,23 @@ test "SemanticCache tokens saved" {
 
     const s = try cache_inst.stats();
     try std.testing.expectEqual(@as(u64, 400), s.tokens_saved);
+}
+
+test "SemanticCache put same key replaces (no duplicates)" {
+    var cache_inst = try SemanticCache.init(":memory:", 60, 1000, 0.95, null);
+    defer cache_inst.deinit();
+
+    try cache_inst.put(std.testing.allocator, "dup_key", "gpt-4", "answer v1", 10, null);
+    try cache_inst.put(std.testing.allocator, "dup_key", "gpt-4", "answer v2", 20, null);
+    try cache_inst.put(std.testing.allocator, "dup_key", "gpt-4", "answer v3", 30, null);
+
+    // Should have exactly 1 entry, not 3
+    const s2 = try cache_inst.stats();
+    try std.testing.expectEqual(@as(usize, 1), s2.count);
+
+    // Should return the latest
+    const result = try cache_inst.get(std.testing.allocator, "dup_key", null);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.response);
+    try std.testing.expectEqualStrings("answer v3", result.?.response);
 }

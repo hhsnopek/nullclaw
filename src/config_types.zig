@@ -498,7 +498,7 @@ pub const MemoryConfig = struct {
             },
             .minimal_none => {
                 if (std.mem.eql(u8, self.backend, "sqlite")) self.backend = "none";
-                self.auto_save = false;
+                if (self.auto_save) self.auto_save = false;
             },
             .custom => {
                 // No defaults applied — user controls everything.

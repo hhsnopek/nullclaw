@@ -41,8 +41,8 @@ pub const MemoryStoreTool = struct {
         const category = MemoryCategory.fromString(category_str);
 
         const m = self.memory orelse {
-            const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Would store: {s} = {s}", .{ key, content });
-            return ToolResult{ .success = true, .output = msg };
+            const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot store: {s} = {s}", .{ key, content });
+            return ToolResult{ .success = false, .output = msg };
         };
 
         m.store(key, content, category, null) catch |err| {
@@ -83,7 +83,7 @@ test "memory_store executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    try std.testing.expect(result.success);
+    try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "lang") != null);
 }

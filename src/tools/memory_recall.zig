@@ -40,7 +40,7 @@ pub const MemoryRecallTool = struct {
 
         const m = self.memory orelse {
             const msg = try std.fmt.allocPrint(allocator, "Memory backend not configured. Cannot search for: {s}", .{query});
-            return ToolResult{ .success = true, .output = msg };
+            return ToolResult{ .success = false, .output = msg };
         };
 
         // Use retrieval engine (hybrid pipeline) when MemoryRuntime is available,
@@ -152,7 +152,7 @@ test "memory_recall executes without backend" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    try std.testing.expect(result.success);
+    try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not configured") != null);
 }
 

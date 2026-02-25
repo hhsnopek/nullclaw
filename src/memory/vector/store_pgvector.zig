@@ -164,8 +164,10 @@ pub const PgvectorVectorStore = struct {
         try buf.append(allocator, '[');
         for (embedding, 0..) |val, i| {
             if (i > 0) try buf.append(allocator, ',');
+            // NaN/Inf are not valid in pgvector literals — reject them.
+            if (std.math.isNan(val) or std.math.isInf(val)) return error.InvalidEmbeddingValue;
             var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch continue;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch return error.FormatError;
             try buf.appendSlice(allocator, s);
         }
         try buf.append(allocator, ']');

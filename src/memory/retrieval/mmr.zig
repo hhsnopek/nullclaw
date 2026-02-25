@@ -169,7 +169,10 @@ pub fn applyMmr(
     // Steps 2-4: Iterative MMR selection
     while (selected_count < result_len) {
         var best_mmr: f64 = -std.math.inf(f64);
-        var best_mmr_idx: usize = 0;
+        // Initialize to first unselected candidate to avoid re-selecting index 0
+        var best_mmr_idx: usize = for (0..n) |i| {
+            if (!is_selected[i]) break i;
+        } else break; // all selected (shouldn't happen)
 
         for (0..n) |i| {
             if (is_selected[i]) continue;

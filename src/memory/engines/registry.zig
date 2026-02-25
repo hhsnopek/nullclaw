@@ -158,6 +158,7 @@ pub fn resolvePaths(
         try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
     else
         null;
+    errdefer if (db_path) |p| allocator.free(std.mem.span(p));
 
     var pg_url: ?[*:0]const u8 = null;
     var pg_schema: []const u8 = "public";

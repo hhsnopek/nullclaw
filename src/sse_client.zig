@@ -32,6 +32,9 @@ pub const SseConnection = struct {
     url: []const u8,
     /// Buffer for reading response data
     transfer_buf: [4096]u8,
+    /// Last received event ID for reconnection (W3C SSE spec).
+    /// Sent as Last-Event-ID header on reconnect so the server can resume.
+    last_event_id: ?[]const u8 = null,
 
     pub const Error = error{
         NotConnected,
@@ -63,6 +66,14 @@ pub const SseConnection = struct {
         }
         // Deinit client (closes any remaining connections).
         self.client.deinit();
+        if (self.last_event_id) |id| self.allocator.free(id);
+        self.last_event_id = null;
+    }
+
+    /// Update the stored last event ID (takes ownership via dupe).
+    pub fn setLastEventId(self: *SseConnection, id: []const u8) void {
+        if (self.last_event_id) |old| self.allocator.free(old);
+        self.last_event_id = self.allocator.dupe(u8, id) catch null;
     }
 
     /// Connect to SSE endpoint and start streaming
@@ -72,11 +83,18 @@ pub const SseConnection = struct {
         const uri = try std.Uri.parse(self.url);
         self.body_reader = null;
 
-        // Build request options with SSE headers
-        const extra_headers = [_]std.http.Header{
-            .{ .name = "Accept", .value = "text/event-stream" },
-        };
-        const options: std.http.Client.RequestOptions = .{ .extra_headers = &extra_headers };
+        // Build request options with SSE headers.
+        // Per W3C SSE spec, send Last-Event-ID on reconnection so the server
+        // can replay missed events.
+        var extra_headers_buf: [2]std.http.Header = undefined;
+        var n_headers: usize = 0;
+        extra_headers_buf[n_headers] = .{ .name = "Accept", .value = "text/event-stream" };
+        n_headers += 1;
+        if (self.last_event_id) |id| {
+            extra_headers_buf[n_headers] = .{ .name = "Last-Event-ID", .value = id };
+            n_headers += 1;
+        }
+        const options: std.http.Client.RequestOptions = .{ .extra_headers = extra_headers_buf[0..n_headers] };
 
         // Replace any previous request before opening a new stream.
         if (self.request) |*req| {
@@ -245,6 +263,18 @@ pub const SseEvent = struct {
     }
 };
 
+/// Helper to transfer ownership of an ArrayList(u8) to a caller-owned slice,
+/// or free the backing capacity if items are empty. Returns &.{} when empty.
+fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
+    if (list.items.len > 0) {
+        return try list.toOwnedSlice(allocator);
+    } else {
+        // Free any retained capacity (e.g. from clearRetainingCapacity)
+        list.deinit(allocator);
+        return @as([]u8, &.{});
+    }
+}
+
 /// Parse SSE events from a buffer
 /// Returns a slice of events (caller must free each event.data and the slice itself)
 ///
@@ -284,15 +314,8 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
                 const data = try current_data.toOwnedSlice(allocator);
                 errdefer allocator.free(data);
 
-                const event_type = if (current_event_type.items.len > 0)
-                    try current_event_type.toOwnedSlice(allocator)
-                else
-                    @as([]u8, &.{});
-
-                const id = if (current_id.items.len > 0)
-                    try current_id.toOwnedSlice(allocator)
-                else
-                    @as([]u8, &.{});
+                const event_type = try ownOrFreeList(&current_event_type, allocator);
+                const id = try ownOrFreeList(&current_id, allocator);
 
                 try events.append(allocator, .{
                     .data = data,
@@ -322,10 +345,24 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
             const newline_len: usize = if (has_data) 1 else 0;
             const new_size = total_event_size + value.len + newline_len;
             if (new_size > MAX_EVENT_SIZE) {
-                // Event too large - finalize current event and skip remaining data
+                // Event too large - finalize current event and skip remaining data.
+                // Include event_type/id so the caller can still identify the truncated event.
                 if (has_data) {
                     const owned = try current_data.toOwnedSlice(allocator);
-                    try events.append(allocator, .{ .data = owned });
+                    errdefer allocator.free(owned);
+
+                    const etype = try ownOrFreeList(&current_event_type, allocator);
+                    const eid = try ownOrFreeList(&current_id, allocator);
+
+                    try events.append(allocator, .{
+                        .data = owned,
+                        .event_type = etype,
+                        .id = eid,
+                    });
+                } else {
+                    // No data yet but event_type/id may have backing allocations
+                    current_event_type.deinit(allocator);
+                    current_id.deinit(allocator);
                 }
                 current_data = .{};
                 current_event_type = .{};
@@ -361,7 +398,20 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
     // Handle any remaining data without trailing newline
     if (has_data) {
         const data = try current_data.toOwnedSlice(allocator);
-        try events.append(allocator, .{ .data = data });
+        errdefer allocator.free(data);
+
+        const event_type = try ownOrFreeList(&current_event_type, allocator);
+        const id = try ownOrFreeList(&current_id, allocator);
+
+        try events.append(allocator, .{
+            .data = data,
+            .event_type = event_type,
+            .id = id,
+        });
+        // Mark as consumed so the defers don't double-free
+        current_data = .{};
+        current_event_type = .{};
+        current_id = .{};
     }
 
     return try events.toOwnedSlice(allocator);

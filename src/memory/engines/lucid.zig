@@ -306,10 +306,29 @@ pub const LucidMemory = struct {
             return allocator.alloc(MemoryEntry, 0);
         }
 
+        const batches = [2][]MemoryEntry{ primary, secondary };
+        var batch_idx: usize = 0;
+        var entry_idx: usize = 0;
+
         var merged: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
             for (merged.items) |*e| e.deinit(allocator);
             merged.deinit(allocator);
+            // Free remaining unprocessed entries from current and subsequent batches.
+            // On error mid-iteration, entries already appended to `merged` are freed above,
+            // but entries not yet visited would leak without this cleanup.
+            var bi = batch_idx;
+            var ei = entry_idx;
+            while (bi < batches.len) {
+                while (ei < batches[bi].len) {
+                    var e = batches[bi][ei];
+                    e.deinit(allocator);
+                    ei += 1;
+                }
+                allocator.free(batches[bi]);
+                bi += 1;
+                ei = 0;
+            }
         }
 
         // Track seen keys by lowered signature (key + '\0' + content)
@@ -321,8 +340,12 @@ pub const LucidMemory = struct {
         }
 
         // Process primary first, then secondary
-        for ([_][]MemoryEntry{ primary, secondary }) |batch| {
-            for (batch) |entry| {
+        while (batch_idx < batches.len) {
+            entry_idx = 0;
+            while (entry_idx < batches[batch_idx].len) {
+                const entry = batches[batch_idx][entry_idx];
+                entry_idx += 1; // advance past this entry (now "processed")
+
                 if (merged.items.len >= limit) {
                     // Free remaining entries from this batch that won't be used
                     var e_copy = entry;
@@ -342,7 +365,8 @@ pub const LucidMemory = struct {
                 }
             }
             // Free the batch slice itself (but not entries — they're moved)
-            allocator.free(batch);
+            allocator.free(batches[batch_idx]);
+            batch_idx += 1;
         }
 
         return merged.toOwnedSlice(allocator);

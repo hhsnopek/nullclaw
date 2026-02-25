@@ -168,8 +168,10 @@ pub const QdrantVectorStore = struct {
         try buf.appendSlice(alloc, "\",\"vector\":[");
         for (embedding, 0..) |val, i| {
             if (i > 0) try buf.append(alloc, ',');
+            // NaN/Inf produce invalid JSON — reject them.
+            if (std.math.isNan(val) or std.math.isInf(val)) return error.InvalidEmbeddingValue;
             var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch continue;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch return error.FormatError;
             try buf.appendSlice(alloc, s);
         }
         try buf.appendSlice(alloc, "],\"payload\":{\"key\":\"");
@@ -186,13 +188,15 @@ pub const QdrantVectorStore = struct {
         try buf.appendSlice(alloc, "{\"vector\":[");
         for (query_embedding, 0..) |val, i| {
             if (i > 0) try buf.append(alloc, ',');
+            // NaN/Inf produce invalid JSON — reject them.
+            if (std.math.isNan(val) or std.math.isInf(val)) return error.InvalidEmbeddingValue;
             var tmp: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch continue;
+            const s = std.fmt.bufPrint(&tmp, "{d}", .{val}) catch return error.FormatError;
             try buf.appendSlice(alloc, s);
         }
         try buf.appendSlice(alloc, "],\"limit\":");
         var lim_buf: [16]u8 = undefined;
-        const lim_str = std.fmt.bufPrint(&lim_buf, "{d}", .{limit}) catch "10";
+        const lim_str = std.fmt.bufPrint(&lim_buf, "{d}", .{limit}) catch return error.FormatError;
         try buf.appendSlice(alloc, lim_str);
         try buf.appendSlice(alloc, ",\"with_payload\":true}");
 

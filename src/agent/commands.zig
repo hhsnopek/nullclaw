@@ -1523,6 +1523,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             \\  /dock-telegram, /dock-discord, /dock-slack
             \\  /activation, /send, /elevated, /bash, /poll, /skill
             \\  /doctor — memory subsystem diagnostics
+            \\  /memory <reindex|doctor|stats>
             \\  exit, quit
         );
     }

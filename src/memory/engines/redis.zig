@@ -313,6 +313,36 @@ pub const RedisMemory = struct {
         const entry_key = try self_.prefixedKey("entry", key);
         defer self_.allocator.free(entry_key);
 
+        // On upsert, clean up stale category/session index sets before overwriting.
+        // If the key already exists with a different category or session_id, the old
+        // index sets would retain a stale reference to this key.
+        var old_cat_resp = try self_.sendCommand(&.{ "HGET", entry_key, "category" });
+        const old_cat_str = old_cat_resp.asString();
+        defer old_cat_resp.deinit(self_.allocator);
+
+        var old_sid_resp = try self_.sendCommand(&.{ "HGET", entry_key, "session_id" });
+        const old_sid_str = old_sid_resp.asString();
+        defer old_sid_resp.deinit(self_.allocator);
+
+        if (old_cat_str) |old_cat| {
+            if (old_cat.len > 0 and !std.mem.eql(u8, old_cat, cat_str)) {
+                const old_cat_set = try self_.prefixedKey("cat", old_cat);
+                defer self_.allocator.free(old_cat_set);
+                var srem_resp = try self_.sendCommand(&.{ "SREM", old_cat_set, key });
+                srem_resp.deinit(self_.allocator);
+            }
+        }
+
+        if (old_sid_str) |old_sid| {
+            const new_sid = session_id orelse "";
+            if (old_sid.len > 0 and !std.mem.eql(u8, old_sid, new_sid)) {
+                const old_sess_set = try self_.prefixedKey("sessions", old_sid);
+                defer self_.allocator.free(old_sess_set);
+                var srem_resp = try self_.sendCommand(&.{ "SREM", old_sess_set, key });
+                srem_resp.deinit(self_.allocator);
+            }
+        }
+
         // HSET {entry_key} id {id} content {content} category {cat} session_id {sid} created_at {ts} updated_at {ts}
         const sid = session_id orelse "";
         var resp = try self_.sendCommand(&.{

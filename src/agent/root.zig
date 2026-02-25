@@ -584,7 +584,7 @@ pub const Agent = struct {
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                const ts = @as(u128, @intCast(std.time.nanoTimestamp()));
+                const ts: u128 = @bitCast(std.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
@@ -883,12 +883,17 @@ pub const Agent = struct {
                 // Auto-save assistant response
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        const summary = if (base_text.len > 100) base_text[0..100] else base_text;
-                        const ts = @as(u128, @intCast(std.time.nanoTimestamp()));
+                        // Truncate to ~100 bytes on a valid UTF-8 boundary
+                        const summary = if (base_text.len > 100) blk: {
+                            var end: usize = 100;
+                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
+                            break :blk base_text[0..end];
+                        } else base_text;
+                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
-                            mem.store(key, summary, .daily, self.memory_session_id) catch {};
+                            mem.store(key, summary, .conversation, self.memory_session_id) catch {};
                             // Vector sync after auto-save
                             if (self.mem_rt) |rt| {
                                 rt.syncVectorAfterStore(self.allocator, key, summary);

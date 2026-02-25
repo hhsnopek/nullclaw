@@ -750,7 +750,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                             if (v == .string) self.audio_media.base_url = try self.allocator.dupe(u8, v.string);
                                         }
                                         if (m0.object.get("language")) |v| {
-                                            if (v == .string) self.audio_media.language = try self.allocator.dupe(u8, v.string);
+                                            if (v == .string) {
+                                                // Free prior allocation from audio.language if it was set above
+                                                if (self.audio_media.language) |prev| self.allocator.free(prev);
+                                                self.audio_media.language = try self.allocator.dupe(u8, v.string);
+                                            }
                                         }
                                     }
                                 }

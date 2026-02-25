@@ -193,7 +193,10 @@ pub const Config = struct {
         if (std.fs.openFileAbsolute(config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
-            cfg.parseJson(content) catch {};
+            cfg.parseJson(content) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {}, // malformed JSON — use defaults for unparsed fields
+            };
         } else |_| {
             // Config file doesn't exist yet — use defaults
         }

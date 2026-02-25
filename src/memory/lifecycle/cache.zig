@@ -69,13 +69,21 @@ pub const ResponseCache = struct {
     }
 
     /// Build a deterministic cache key from model + system prompt + user prompt.
-    /// Uses a simple hash (FNV-1a) since we don't have SHA-256 in std.
+    /// Uses length-prefixed hashing to prevent delimiter-collision attacks
+    /// (e.g. model="a|" + sys="b" vs model="a" + sys="|b").
     pub fn cacheKey(model: []const u8, system_prompt: ?[]const u8, user_prompt: []const u8) u64 {
         var hasher = std.hash.Fnv1a_64.init();
+        // Length-prefix each field so boundaries are unambiguous
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(model.len))));
         hasher.update(model);
-        hasher.update("|");
-        if (system_prompt) |sys| hasher.update(sys);
-        hasher.update("|");
+        if (system_prompt) |sys| {
+            hasher.update(std.mem.asBytes(&@as(u32, @intCast(sys.len))));
+            hasher.update(sys);
+        } else {
+            // Distinct sentinel for null vs empty string
+            hasher.update(&[_]u8{ 0xff, 0xff, 0xff, 0xff });
+        }
+        hasher.update(std.mem.asBytes(&@as(u32, @intCast(user_prompt.len))));
         hasher.update(user_prompt);
         return hasher.final();
     }
@@ -439,6 +447,21 @@ test "cache key includes system prompt in hash" {
     const k1 = ResponseCache.cacheKey("gpt-4", "system A", "hello");
     const k2 = ResponseCache.cacheKey("gpt-4", "system B", "hello");
     try std.testing.expect(k1 != k2);
+}
+
+test "cache key no delimiter collision" {
+    // With naive "|" delimiter, these would collide:
+    //   model="a" sys="|b"  prompt="c"  -> hash("a||b|c")
+    //   model="a" sys=""    prompt="b|c" -> hash("a||b|c")
+    // Length-prefixed hashing prevents this.
+    const k1 = ResponseCache.cacheKey("a", "|b", "c");
+    const k2 = ResponseCache.cacheKey("a", "", "b|c");
+    try std.testing.expect(k1 != k2);
+
+    // Also: null sys vs empty sys must differ
+    const k3 = ResponseCache.cacheKey("m", null, "p");
+    const k4 = ResponseCache.cacheKey("m", "", "p");
+    try std.testing.expect(k3 != k4);
 }
 
 test "cache unicode prompt handling" {
