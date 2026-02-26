@@ -306,7 +306,11 @@ pub fn extractContent(allocator: std.mem.Allocator, body: []const u8) ![]const u
         if (choices.array.items.len > 0) {
             if (choices.array.items[0].object.get("message")) |msg| {
                 if (msg.object.get("content")) |content| {
-                    if (content == .string) return try allocator.dupe(u8, content.string);
+                    if (content == .string and content.string.len > 0) return try allocator.dupe(u8, content.string);
+                }
+                // Thinking models: fall back to reasoning_content
+                if (msg.object.get("reasoning_content")) |rc| {
+                    if (rc == .string and rc.string.len > 0) return try allocator.dupe(u8, rc.string);
                 }
             }
         }

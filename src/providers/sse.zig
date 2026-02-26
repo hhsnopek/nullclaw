@@ -5,6 +5,8 @@ const root = @import("root.zig");
 pub const SseLineResult = union(enum) {
     /// Text delta content (owned, caller frees).
     delta: []const u8,
+    /// Thinking/reasoning delta content (owned, caller frees).
+    thinking_delta: []const u8,
     /// Stream is complete ([DONE] sentinel).
     done: void,
     /// Line should be skipped (empty, comment, or no content).
@@ -30,13 +32,22 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
-    const content = try extractDeltaContent(allocator, data) orelse return .skip;
-    return .{ .delta = content };
+    const result = try extractDeltaContentEx(allocator, data) orelse return .skip;
+    if (result.is_thinking) {
+        return .{ .thinking_delta = result.text };
+    }
+    return .{ .delta = result.text };
 }
 
-/// Extract `choices[0].delta.content` from an SSE JSON payload.
-/// Returns owned slice or null if no content found.
-pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
+/// Result of extracting delta content, distinguishing normal vs thinking content.
+pub const DeltaContentResult = struct {
+    text: []const u8,
+    is_thinking: bool,
+};
+
+/// Extract `choices[0].delta.content` or `choices[0].delta.reasoning_content` from an SSE JSON payload.
+/// Returns text and whether it's thinking content, or null if neither found.
+pub fn extractDeltaContentEx(allocator: std.mem.Allocator, json_str: []const u8) !?DeltaContentResult {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
         return error.InvalidSseJson;
     defer parsed.deinit();
@@ -51,11 +62,35 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     const delta = first.object.get("delta") orelse return null;
     if (delta != .object) return null;
 
-    const content = delta.object.get("content") orelse return null;
-    if (content != .string) return null;
-    if (content.string.len == 0) return null;
+    // Check delta.content first (normal content)
+    if (delta.object.get("content")) |content| {
+        if (content == .string and content.string.len > 0) {
+            return .{
+                .text = try allocator.dupe(u8, content.string),
+                .is_thinking = false,
+            };
+        }
+    }
 
-    return try allocator.dupe(u8, content.string);
+    // Fall back to delta.reasoning_content (thinking models)
+    if (delta.object.get("reasoning_content")) |rc| {
+        if (rc == .string and rc.string.len > 0) {
+            return .{
+                .text = try allocator.dupe(u8, rc.string),
+                .is_thinking = true,
+            };
+        }
+    }
+
+    return null;
+}
+
+/// Extract `choices[0].delta.content` from an SSE JSON payload.
+/// Returns owned slice or null if no content found.
+/// Backward-compatible wrapper around extractDeltaContentEx.
+pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
+    const result = try extractDeltaContentEx(allocator, json_str) orelse return null;
+    return result.text;
 }
 
 /// Run curl in SSE streaming mode and parse output line by line.
@@ -159,6 +194,10 @@ pub fn curlStream(
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
+                    .thinking_delta => |text| {
+                        defer allocator.free(text);
+                        callback(ctx, root.StreamChunk.thinkingDelta(text));
+                    },
                     .done => {
                         saw_done = true;
                         break :outer;
@@ -181,6 +220,10 @@ pub fn curlStream(
                     defer allocator.free(text);
                     try accumulated.appendSlice(allocator, text);
                     callback(ctx, root.StreamChunk.textDelta(text));
+                },
+                .thinking_delta => |text| {
+                    defer allocator.free(text);
+                    callback(ctx, root.StreamChunk.thinkingDelta(text));
                 },
                 .done => {},
                 .skip => {},

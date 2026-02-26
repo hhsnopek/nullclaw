@@ -94,8 +94,8 @@ pub fn buildSystemPrompt(
     // Identity section — inject workspace MD files
     try buildIdentitySection(allocator, w, ctx.workspace_dir);
 
-    // Tools section
-    try buildToolsSection(w, ctx.tools);
+    // Tools are handled via native JSON array in the provider request.
+    // No text-based tool listing in the system prompt.
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
@@ -388,7 +388,7 @@ test "buildSystemPrompt includes core sections" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Project Context") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tools") != null);
+    // Tools are sent via native JSON array, not in system prompt text
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Safety") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);

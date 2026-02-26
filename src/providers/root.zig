@@ -209,6 +209,7 @@ pub const StreamChunk = struct {
     delta: []const u8,
     is_final: bool,
     token_count: u32,
+    is_thinking: bool = false,
 
     /// Create a text delta chunk with estimated token count.
     pub fn textDelta(text: []const u8) StreamChunk {
@@ -216,6 +217,16 @@ pub const StreamChunk = struct {
             .delta = text,
             .is_final = false,
             .token_count = @intCast((text.len + 3) / 4),
+        };
+    }
+
+    /// Create a thinking delta chunk (reasoning_content from thinking models).
+    pub fn thinkingDelta(text: []const u8) StreamChunk {
+        return .{
+            .delta = text,
+            .is_final = false,
+            .token_count = @intCast((text.len + 3) / 4),
+            .is_thinking = true,
         };
     }
 

@@ -318,8 +318,14 @@ pub const OpenAiCompatibleProvider = struct {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
                     if (msg.object.get("content")) |content| {
-                        if (content == .string) {
+                        if (content == .string and content.string.len > 0) {
                             return try allocator.dupe(u8, content.string);
+                        }
+                    }
+                    // Thinking models: fall back to reasoning_content
+                    if (msg.object.get("reasoning_content")) |rc| {
+                        if (rc == .string and rc.string.len > 0) {
+                            return try allocator.dupe(u8, rc.string);
                         }
                     }
                 }
@@ -348,6 +354,16 @@ pub const OpenAiCompatibleProvider = struct {
                 if (msg_obj.get("content")) |c| {
                     if (c == .string) {
                         content = try allocator.dupe(u8, c.string);
+                    }
+                }
+
+                // Thinking models (Qwen3, etc.) may return content in reasoning_content
+                if (content == null or (content != null and content.?.len == 0)) {
+                    if (msg_obj.get("reasoning_content")) |rc| {
+                        if (rc == .string and rc.string.len > 0) {
+                            if (content) |c| allocator.free(c);
+                            content = try allocator.dupe(u8, rc.string);
+                        }
                     }
                 }
 

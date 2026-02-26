@@ -259,6 +259,72 @@ pub const SessionManager = struct {
         return response;
     }
 
+    /// Result of a streaming message turn.
+    pub const StreamResult = struct {
+        content: []const u8,
+        total_tokens: u64,
+    };
+
+    /// Process a message with streaming. Sets stream_callback/ctx on the agent,
+    /// calls turn(), captures total_tokens, and returns StreamResult.
+    pub fn processMessageStream(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) !StreamResult {
+        const session = try self.getOrCreate(session_key);
+
+        session.mutex.lock();
+        defer session.mutex.unlock();
+
+        // Set streaming callback on the agent, defer reset
+        session.agent.stream_callback = callback;
+        session.agent.stream_ctx = callback_ctx;
+        defer {
+            session.agent.stream_callback = null;
+            session.agent.stream_ctx = null;
+        }
+
+        const response = try session.agent.turn(content);
+        session.turn_count += 1;
+        session.last_active = std.time.timestamp();
+
+        // Track consolidation timestamp
+        if (session.agent.last_turn_compacted) {
+            session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+        }
+
+        // Persist messages via session store
+        if (self.session_store) |store| {
+            const trimmed = std.mem.trim(u8, content, " \t\r\n");
+            if (slashClearsSession(trimmed)) {
+                store.clearMessages(session_key) catch {};
+                store.clearAutoSaved(session_key) catch {};
+            } else if (!std.mem.startsWith(u8, trimmed, "/")) {
+                store.saveMessage(session_key, "user", content) catch {};
+                store.saveMessage(session_key, "assistant", response) catch {};
+            }
+        }
+
+        return .{
+            .content = response,
+            .total_tokens = session.agent.total_tokens,
+        };
+    }
+
+    /// Evict a specific session by key.
+    pub fn evictSession(self: *SessionManager, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.sessions.fetchRemove(key)) |kv| {
+            const session = kv.value;
+            session.deinit(self.allocator);
+            self.allocator.destroy(session);
+        }
+    }
+
     /// Number of active sessions.
     pub fn sessionCount(self: *SessionManager) usize {
         self.mutex.lock();

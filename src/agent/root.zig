@@ -280,6 +280,9 @@ pub const Agent = struct {
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
+    /// When true, suppress sending tool specs to the provider (tools only via system prompt text).
+    suppress_tools: bool = false,
+
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
@@ -673,15 +676,9 @@ pub const Agent = struct {
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
             });
-            defer self.allocator.free(system_prompt);
 
-            // Append tool instructions
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
+            // Tools are sent via native JSON array only (no text-based tool instructions).
+            const full_system = system_prompt;
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -724,17 +721,22 @@ pub const Agent = struct {
             }
         }
 
-        // Enrich message with memory context (always returns owned slice; ownership → history)
-        // Uses retrieval pipeline (hybrid search, RRF, temporal decay, MMR) when MemoryRuntime is available.
-        const enriched = if (self.mem) |mem|
-            try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, user_message, self.memory_session_id)
-        else
-            try self.allocator.dupe(u8, user_message);
-        errdefer self.allocator.free(enriched);
+        // Inject memory context as a separate system message for KV cache stability.
+        // This avoids prepending memory to the user message, which would invalidate
+        // the prompt cache on every turn.
+        if (self.mem) |mem| {
+            const mem_ctx = try memory_loader.loadContext(self.allocator, mem, user_message, self.memory_session_id);
+            if (mem_ctx.len > 0) {
+                try self.history.append(self.allocator, .{ .role = .system, .content = mem_ctx });
+            } else {
+                self.allocator.free(mem_ctx);
+            }
+        }
 
+        const user_msg = try self.allocator.dupe(u8, user_message);
         try self.history.append(self.allocator, .{
             .role = .user,
-            .content = enriched,
+            .content = user_msg,
         });
 
         // ── Response cache check ──
@@ -780,7 +782,7 @@ pub const Agent = struct {
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
-            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const native_tools_enabled = !is_streaming and !self.suppress_tools and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;

@@ -16,6 +16,7 @@ const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
+const json_util = @import("json_util.zig");
 const providers = @import("providers/root.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
@@ -2075,6 +2076,33 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+// -- SSE Streaming --
+
+/// Context passed to the SSE stream callback via *anyopaque.
+const SseStreamContext = struct {
+    stream: std.net.Stream,
+    allocator: std.mem.Allocator,
+};
+
+/// Stream callback that writes SSE delta events to the TCP connection.
+fn sseStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+    const sse_ctx: *SseStreamContext = @ptrCast(@alignCast(ctx_ptr));
+    if (chunk.is_final or chunk.delta.len == 0) return;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(sse_ctx.allocator);
+
+    // Build: data: {"delta":"<escaped>"}\n\n  (with optional "thinking":true)
+    buf.appendSlice(sse_ctx.allocator, "data: {\"delta\":") catch return;
+    json_util.appendJsonString(&buf, sse_ctx.allocator, chunk.delta) catch return;
+    if (chunk.is_thinking) {
+        buf.appendSlice(sse_ctx.allocator, ",\"thinking\":true") catch return;
+    }
+    buf.appendSlice(sse_ctx.allocator, "}\n\n") catch return;
+
+    _ = sse_ctx.stream.write(buf.items) catch {};
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -2106,7 +2134,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var noop_obs_gateway = observability.NoopObserver{};
-    const needs_local_agent = event_bus == null;
+    // Always create the local agent runtime so that webhook SSE streaming
+    // works even in daemon mode (event_bus != null).  Without a session
+    // manager the /webhook?stream=true path returns "streaming unavailable".
+    const needs_local_agent = true;
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -2240,6 +2271,34 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
     }
 
+    // Warmup: prime the LLM KV cache with the system prompt so the first
+    // real request doesn't pay the full prompt-processing cost (~60s -> ~10s).
+    // Non-fatal -- if LLM is unreachable, gateway still starts normally.
+    if (session_mgr_opt) |*sm| {
+        try stdout.print("Warmup: priming KV cache...\n", .{});
+        try stdout.flush();
+        const warmup_session = sm.getOrCreate("__warmup__") catch null;
+        if (warmup_session) |ws| {
+            ws.agent.suppress_tools = true;
+            const warmup_resp = ws.agent.turn("hi") catch |err| blk: {
+                std.debug.print("Warmup skipped (LLM unreachable): {}\n", .{err});
+                break :blk null;
+            };
+            if (warmup_resp) |resp| {
+                try stdout.print("Warmup complete ({d} bytes)\n", .{resp.len});
+                try stdout.flush();
+                allocator.free(resp);
+                // Only evict after a successful warmup -- evicting a session whose
+                // agent.turn() failed triggers use-after-free in agent.deinit
+                // because the provider may hold dangling internal state.
+                sm.evictSession("__warmup__");
+            } else {
+                try stdout.print("Warmup failed, skipping session cleanup\n", .{});
+                try stdout.flush();
+            }
+        }
+    }
+
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
         var conn = server.accept() catch continue;
@@ -2343,10 +2402,41 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         const body = extractBody(raw);
                         if (body) |b| {
                             const msg_text = jsonStringField(b, "message") orelse jsonStringField(b, "text") orelse b;
-                            var sk_buf: [128]u8 = undefined;
-                            const session_key = std.fmt.bufPrint(&sk_buf, "webhook:{s}", .{bearer orelse "anon"}) catch "webhook:anon";
+                            var sk_buf: [256]u8 = undefined;
+                            const session_id = jsonStringField(b, "session_id");
+                            const session_key = if (session_id) |sid|
+                                std.fmt.bufPrint(&sk_buf, "webhook:{s}:{s}", .{ bearer orelse "anon", sid }) catch "webhook:anon"
+                            else
+                                std.fmt.bufPrint(&sk_buf, "webhook:{s}", .{bearer orelse "anon"}) catch "webhook:anon";
 
-                            if (state.event_bus) |eb| {
+                            // Check for ?stream=true
+                            const is_stream = std.mem.indexOf(u8, target, "stream=true") != null;
+
+                            if (is_stream) {
+                                if (session_mgr_opt) |*sm| {
+                                    // SSE streaming path — write directly to TCP connection
+                                    _ = conn.stream.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch {};
+
+                                    var sse_ctx = SseStreamContext{
+                                        .stream = conn.stream,
+                                        .allocator = allocator,
+                                    };
+
+                                    if (sm.processMessageStream(session_key, msg_text, sseStreamCallback, @ptrCast(&sse_ctx))) |result| {
+                                        defer allocator.free(result.content);
+                                        var done_buf: [128]u8 = undefined;
+                                        const done_msg = std.fmt.bufPrint(&done_buf, "data: {{\"status\":\"done\",\"total_tokens\":{d}}}\n\n", .{result.total_tokens}) catch "data: {\"status\":\"done\"}\n\n";
+                                        _ = conn.stream.write(done_msg) catch {};
+                                    } else |err| {
+                                        std.debug.print("processMessageStream error: {}\n", .{err});
+                                        _ = conn.stream.write("data: {\"error\":\"agent processing failed\"}\n\n") catch {};
+                                        _ = conn.stream.write("data: {\"status\":\"done\"}\n\n") catch {};
+                                    }
+                                    continue; // skip normal response writer
+                                } else {
+                                    response_body = "{\"error\":\"streaming unavailable\"}";
+                                }
+                            } else if (state.event_bus) |eb| {
                                 _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {

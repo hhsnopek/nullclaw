@@ -308,6 +308,8 @@ pub const ReliableProvider = struct {
         .getName = getNameImpl,
         .deinit = deinitImpl,
         .warmup = warmupImpl,
+        .supports_streaming = supportsStreamingImpl,
+        .stream_chat = streamChatImpl,
     };
 
     /// Create a Provider interface from this ReliableProvider.
@@ -516,6 +518,24 @@ pub const ReliableProvider = struct {
         for (self.extras) |entry| {
             entry.provider.warmup();
         }
+    }
+
+    fn supportsStreamingImpl(ptr: *anyopaque) bool {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.supportsStreaming();
+    }
+
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: root.ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        return self.inner.streamChat(allocator, request, model, temperature, callback, callback_ctx);
     }
 };
 
