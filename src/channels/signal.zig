@@ -356,7 +356,7 @@ pub const SignalChannel = struct {
             .reply_target = reply_target_str,
             .first_name = if (source_name) |sn| if (sn.len > 0) try allocator.dupe(u8, sn) else null else null,
             .is_group = dm_group_id != null,
-            .sender_uuid = if (source) |src| if (src.len > 0 and !std.mem.eql(u8, src, sender_raw)) try allocator.dupe(u8, src) else null else null,
+            .sender_uuid = if (source) |src| if (src.len > 0 and isUuid(src)) try allocator.dupe(u8, src) else null else null,
             .group_id = if (dm_group_id) |gid| try allocator.dupe(u8, gid) else null,
         };
 
@@ -2373,6 +2373,8 @@ test "process envelope group accepts uuid allowlist when source_number is presen
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expect(m.is_group);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
 }
 
 test "process envelope group sender not in group_allow_from" {
@@ -2487,6 +2489,8 @@ test "process envelope uuid sender dm" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
     try std.testing.expectEqualStrings("Privacy User", m.first_name.?);
     try std.testing.expectEqualStrings("Hello from privacy user", m.content);
     try std.testing.expectEqualStrings(uuid, m.reply_target.?);
@@ -2529,6 +2533,8 @@ test "process envelope uuid sender in group" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
     try std.testing.expectEqualStrings("group:testgroup", m.reply_target.?);
     try std.testing.expect(m.is_group);
     // Group message should still route as Group.
@@ -2714,6 +2720,7 @@ test "process envelope sender prefers source number" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("+1111111111", m.sender);
+    try std.testing.expect(m.sender_uuid == null);
 }
 
 test "process envelope sender falls back to source" {
@@ -2744,6 +2751,8 @@ test "process envelope sender falls back to source" {
     const m = msg.?;
     defer m.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(uuid, m.sender);
+    try std.testing.expect(m.sender_uuid != null);
+    try std.testing.expectEqualStrings(uuid, m.sender_uuid.?);
 }
 
 test "process envelope sender none when both missing" {

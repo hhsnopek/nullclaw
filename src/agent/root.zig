@@ -293,6 +293,8 @@ pub const Agent = struct {
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
+    /// Whether the currently injected system prompt contains conversation context.
+    system_prompt_has_conversation_context: bool = false,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
 
@@ -644,7 +646,11 @@ pub const Agent = struct {
             self.has_system_prompt = false;
         }
 
-        if (!self.has_system_prompt or self.conversation_context != null) {
+        const turn_has_conversation_context = self.conversation_context != null;
+        const conversation_context_changed = self.has_system_prompt and
+            self.system_prompt_has_conversation_context != turn_has_conversation_context;
+
+        if (!self.has_system_prompt or conversation_context_changed) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
             defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
             const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
@@ -693,6 +699,7 @@ pub const Agent = struct {
                 });
             }
             self.has_system_prompt = true;
+            self.system_prompt_has_conversation_context = turn_has_conversation_context;
             self.workspace_prompt_fingerprint = workspace_fp;
         }
 
@@ -1405,6 +1412,7 @@ pub const Agent = struct {
         }
         self.history.items.len = 0;
         self.has_system_prompt = false;
+        self.system_prompt_has_conversation_context = false;
         self.workspace_prompt_fingerprint = null;
     }
 

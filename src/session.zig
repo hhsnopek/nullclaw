@@ -430,6 +430,39 @@ test "processMessage returns mock response" {
     try testing.expectEqualStrings("Hello from mock", resp);
 }
 
+test "processMessage refreshes system prompt when conversation context is cleared" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const sender_uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+    const with_context: ?ConversationContext = .{
+        .channel = "signal",
+        .sender_number = "+15551234567",
+        .sender_uuid = sender_uuid,
+        .group_id = null,
+        .is_group = false,
+    };
+
+    const resp1 = try sm.processMessage("ctx:user", "first", with_context);
+    defer testing.allocator.free(resp1);
+
+    const session = try sm.getOrCreate("ctx:user");
+    try testing.expect(session.agent.history.items.len > 0);
+    const sys1 = session.agent.history.items[0].content;
+    try testing.expect(std.mem.indexOf(u8, sys1, "## Conversation Context") != null);
+    try testing.expect(std.mem.indexOf(u8, sys1, sender_uuid) != null);
+
+    const resp2 = try sm.processMessage("ctx:user", "second", null);
+    defer testing.allocator.free(resp2);
+
+    try testing.expect(session.agent.history.items.len > 0);
+    const sys2 = session.agent.history.items[0].content;
+    try testing.expect(std.mem.indexOf(u8, sys2, "## Conversation Context") == null);
+    try testing.expect(std.mem.indexOf(u8, sys2, sender_uuid) == null);
+}
+
 test "processMessage updates last_active" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
