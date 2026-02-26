@@ -8,6 +8,18 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 
+fn parseExpiresIn(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| if (i > 0) i else null,
+        .float => |f| blk: {
+            if (!std.math.isFinite(f) or f <= 0) break :blk null;
+            if (f > @as(f64, @floatFromInt(std.math.maxInt(i64)))) break :blk null;
+            break :blk @intFromFloat(f);
+        },
+        else => null,
+    };
+}
+
 fn isFormUrlencodedUnreserved(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~';
 }
@@ -155,11 +167,7 @@ pub fn parseRefreshResponse(allocator: std.mem.Allocator, json_bytes: []const u8
     if (access_token_str.len == 0) return null;
 
     const expires_in_val = root_obj.get("expires_in") orelse return null;
-    const expires_in: i64 = switch (expires_in_val) {
-        .integer => |i| i,
-        .float => |f| @intFromFloat(f),
-        else => return null,
-    };
+    const expires_in = parseExpiresIn(expires_in_val) orelse return null;
 
     // Dupe access_token so it survives parsed.deinit()
     const access_token = allocator.dupe(u8, access_token_str) catch return null;
@@ -219,7 +227,7 @@ pub fn writeCredentialsJson(allocator: std.mem.Allocator, creds: GeminiCliCreden
 
     try buf.append(allocator, '}');
 
-    const file = std.fs.createFileAbsolute(path, .{}) catch return error.FileWriteError;
+    const file = std.fs.createFileAbsolute(path, .{ .mode = 0o600 }) catch return error.FileWriteError;
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -1114,6 +1122,25 @@ test "parseRefreshResponse handles missing fields" {
     try std.testing.expect(result == null);
 }
 
+test "parseRefreshResponse rejects invalid expires_in float" {
+    const json =
+        \\{"access_token":"new-token-abc","expires_in":"not-a-number"}
+    ;
+    const result = parseRefreshResponse(std.testing.allocator, json);
+    try std.testing.expect(result == null);
+}
+
+test "parseRefreshResponse rejects non-positive expires_in" {
+    const json_zero =
+        \\{"access_token":"new-token-abc","expires_in":0}
+    ;
+    const json_neg =
+        \\{"access_token":"new-token-abc","expires_in":-5}
+    ;
+    try std.testing.expect(parseRefreshResponse(std.testing.allocator, json_zero) == null);
+    try std.testing.expect(parseRefreshResponse(std.testing.allocator, json_neg) == null);
+}
+
 test "refreshOAuthToken returns test token in test mode" {
     const alloc = std.testing.allocator;
     const resp = try refreshOAuthToken(alloc, "test-refresh-token");
@@ -1201,6 +1228,14 @@ test "writeCredentialsJson produces valid JSON" {
     try std.testing.expectEqualStrings("test-access-token", obj.get("access_token").?.string);
     try std.testing.expectEqualStrings("test-refresh-token", obj.get("refresh_token").?.string);
     try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
+
+    if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        const stat = try file.stat();
+        const mode = stat.mode & 0o777;
+        // Respect process umask: require owner rw and forbid executable bits.
+        try std.testing.expect((mode & 0o600) == 0o600);
+        try std.testing.expect((mode & 0o111) == 0);
+    }
 }
 
 test "writeCredentialsJson without refresh token" {
