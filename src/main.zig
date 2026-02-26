@@ -3,9 +3,15 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const yc = @import("nullclaw");
 
+var sentry_runtime: ?*yc.sentry_runtime.Runtime = null;
+
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     _ = error_return_trace;
     _ = ret_addr;
+    if (sentry_runtime) |runtime| {
+        runtime.capturePanic(msg);
+        runtime.flush(1500);
+    }
     std.fs.File.stderr().writeAll("panic: ") catch {};
     std.fs.File.stderr().writeAll(msg) catch {};
     std.fs.File.stderr().writeAll("\n") catch {};
@@ -70,7 +76,19 @@ pub fn main() !void {
     }
 
     const allocator = std.heap.smp_allocator;
+    var runtime = yc.sentry_runtime.Runtime.init(allocator);
+    defer runtime.deinit();
+    sentry_runtime = &runtime;
+    defer sentry_runtime = null;
 
+    runMain(allocator) catch |err| {
+        runtime.captureError("main", @errorName(err));
+        runtime.flush(2000);
+        return err;
+    };
+}
+
+fn runMain(allocator: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 

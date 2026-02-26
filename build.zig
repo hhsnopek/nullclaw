@@ -308,6 +308,11 @@ pub fn build(b: *std.Build) void {
         break :blk sqlite3_artifact;
     } else null;
 
+    const sentry_dep = b.dependency("sentry_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     var build_options = b.addOptions();
     build_options.addOption([]const u8, "version", app_version);
     build_options.addOption(bool, "enable_memory_none", enable_memory_none);
@@ -346,6 +351,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lib_mod.addImport("build_options", build_options_module);
+    lib_mod.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
     if (sqlite3) |lib| {
         lib_mod.linkLibrary(lib);
     }
@@ -366,6 +372,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("build_options", build_options_module);
+    exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 
     // Link SQLite on the compile step (not the module)
     if (sqlite3) |lib| {
