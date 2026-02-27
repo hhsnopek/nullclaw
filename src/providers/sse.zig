@@ -1,12 +1,22 @@
 const std = @import("std");
 const root = @import("root.zig");
 
+/// A single tool call delta from streaming SSE.
+pub const ToolCallDelta = struct {
+    index: u32,
+    id: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    arguments_fragment: ?[]const u8 = null,
+};
+
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
     /// Text delta content (owned, caller frees).
     delta: []const u8,
     /// Thinking/reasoning delta content (owned, caller frees).
     thinking_delta: []const u8,
+    /// Tool call delta (fields owned, caller frees).
+    tool_call_delta: ToolCallDelta,
     /// Stream is complete ([DONE] sentinel).
     done: void,
     /// Line should be skipped (empty, comment, or no content).
@@ -31,6 +41,11 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
     const data = trimmed[prefix.len..];
 
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
+
+    // Check for tool_calls first (they appear alongside or instead of content)
+    if (try extractToolCallDelta(allocator, data)) |tc_delta| {
+        return .{ .tool_call_delta = tc_delta };
+    }
 
     const result = try extractDeltaContentEx(allocator, data) orelse return .skip;
     if (result.is_thinking) {
@@ -83,6 +98,65 @@ pub fn extractDeltaContentEx(allocator: std.mem.Allocator, json_str: []const u8)
     }
 
     return null;
+}
+
+/// Extract `choices[0].delta.tool_calls[0]` from an SSE JSON payload.
+/// Returns a ToolCallDelta with owned fields, or null if no tool_calls found.
+fn extractToolCallDelta(allocator: std.mem.Allocator, json_str: []const u8) !?ToolCallDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
+        return null;
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    const choices = obj.get("choices") orelse return null;
+    if (choices != .array or choices.array.items.len == 0) return null;
+
+    const first = choices.array.items[0];
+    if (first != .object) return null;
+
+    const delta = first.object.get("delta") orelse return null;
+    if (delta != .object) return null;
+
+    const tool_calls = delta.object.get("tool_calls") orelse return null;
+    if (tool_calls != .array or tool_calls.array.items.len == 0) return null;
+
+    const tc = tool_calls.array.items[0];
+    if (tc != .object) return null;
+
+    const index: u32 = if (tc.object.get("index")) |idx|
+        if (idx == .integer) @intCast(@max(0, idx.integer)) else 0
+    else
+        0;
+
+    var result = ToolCallDelta{ .index = index };
+
+    if (tc.object.get("id")) |id_val| {
+        if (id_val == .string and id_val.string.len > 0) {
+            result.id = try allocator.dupe(u8, id_val.string);
+        }
+    }
+
+    if (tc.object.get("function")) |func| {
+        if (func == .object) {
+            if (func.object.get("name")) |name_val| {
+                if (name_val == .string and name_val.string.len > 0) {
+                    result.name = try allocator.dupe(u8, name_val.string);
+                }
+            }
+            if (func.object.get("arguments")) |args_val| {
+                if (args_val == .string and args_val.string.len > 0) {
+                    result.arguments_fragment = try allocator.dupe(u8, args_val.string);
+                }
+            }
+        }
+    }
+
+    // Only return if we got at least one useful field
+    if (result.id == null and result.name == null and result.arguments_fragment == null) {
+        return null;
+    }
+
+    return result;
 }
 
 /// Extract `choices[0].delta.content` from an SSE JSON payload.
@@ -170,6 +244,18 @@ pub fn curlStream(
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
     defer accumulated.deinit(allocator);
 
+    // Tool call accumulation: up to 4 concurrent tool calls
+    const max_tc = 4;
+    var tc_ids: [max_tc]std.ArrayListUnmanaged(u8) = [_]std.ArrayListUnmanaged(u8){.empty} ** max_tc;
+    var tc_names: [max_tc]std.ArrayListUnmanaged(u8) = [_]std.ArrayListUnmanaged(u8){.empty} ** max_tc;
+    var tc_args: [max_tc]std.ArrayListUnmanaged(u8) = [_]std.ArrayListUnmanaged(u8){.empty} ** max_tc;
+    var tc_seen: [max_tc]bool = [_]bool{false} ** max_tc;
+    defer for (0..max_tc) |i| {
+        tc_ids[i].deinit(allocator);
+        tc_names[i].deinit(allocator);
+        tc_args[i].deinit(allocator);
+    };
+
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
@@ -198,6 +284,18 @@ pub fn curlStream(
                         defer allocator.free(text);
                         callback(ctx, root.StreamChunk.thinkingDelta(text));
                     },
+                    .tool_call_delta => |tcd| {
+                        defer {
+                            if (tcd.id) |id| allocator.free(id);
+                            if (tcd.name) |name| allocator.free(name);
+                            if (tcd.arguments_fragment) |frag| allocator.free(frag);
+                        }
+                        const idx: usize = @min(tcd.index, max_tc - 1);
+                        tc_seen[idx] = true;
+                        if (tcd.id) |id| try tc_ids[idx].appendSlice(allocator, id);
+                        if (tcd.name) |name| try tc_names[idx].appendSlice(allocator, name);
+                        if (tcd.arguments_fragment) |frag| try tc_args[idx].appendSlice(allocator, frag);
+                    },
                     .done => {
                         saw_done = true;
                         break :outer;
@@ -225,6 +323,18 @@ pub fn curlStream(
                     defer allocator.free(text);
                     callback(ctx, root.StreamChunk.thinkingDelta(text));
                 },
+                .tool_call_delta => |tcd| {
+                    defer {
+                        if (tcd.id) |id| allocator.free(id);
+                        if (tcd.name) |name| allocator.free(name);
+                        if (tcd.arguments_fragment) |frag| allocator.free(frag);
+                    }
+                    const idx: usize = @min(tcd.index, max_tc - 1);
+                    tc_seen[idx] = true;
+                    if (tcd.id) |id| try tc_ids[idx].appendSlice(allocator, id);
+                    if (tcd.name) |name| try tc_names[idx].appendSlice(allocator, name);
+                    if (tcd.arguments_fragment) |frag| try tc_args[idx].appendSlice(allocator, frag);
+                },
                 .done => {},
                 .skip => {},
             }
@@ -251,10 +361,33 @@ pub fn curlStream(
     else
         null;
 
+    // Build tool calls from accumulated deltas
+    var tc_count: usize = 0;
+    for (0..max_tc) |i| {
+        if (tc_seen[i]) tc_count += 1;
+    }
+
+    var tool_calls: []const root.ToolCall = &.{};
+    if (tc_count > 0) {
+        var tc_list = try allocator.alloc(root.ToolCall, tc_count);
+        var tc_idx: usize = 0;
+        for (0..max_tc) |i| {
+            if (!tc_seen[i]) continue;
+            tc_list[tc_idx] = .{
+                .id = if (tc_ids[i].items.len > 0) try allocator.dupe(u8, tc_ids[i].items) else "",
+                .name = if (tc_names[i].items.len > 0) try allocator.dupe(u8, tc_names[i].items) else "",
+                .arguments = if (tc_args[i].items.len > 0) try allocator.dupe(u8, tc_args[i].items) else "{}",
+            };
+            tc_idx += 1;
+        }
+        tool_calls = tc_list;
+    }
+
     return .{
         .content = content,
         .usage = .{ .completion_tokens = @intCast((accumulated.items.len + 3) / 4) },
         .model = "",
+        .tool_calls = tool_calls,
     };
 }
 

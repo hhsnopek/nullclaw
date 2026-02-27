@@ -65,6 +65,7 @@ pub const SecurityPolicy = struct {
     workspace_dir: []const u8 = ".",
     workspace_only: bool = true,
     allowed_commands: []const []const u8 = &default_allowed_commands,
+    blocked_commands: []const []const u8 = &.{},
     max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
@@ -150,11 +151,59 @@ pub const SecurityPolicy = struct {
     }
 
     /// Check if a shell command is allowed.
+    ///
+    /// Evaluation order:
+    ///   1. read_only autonomy → deny all
+    ///   2. Oversized / catastrophic patterns → deny always
+    ///   3. blocked_commands (explicit deny list) → deny regardless of autonomy
+    ///   4. full autonomy → allow (no syntactic or allowlist checks)
+    ///   5. Syntactic guards (subshell, &, >, tee) → deny
+    ///   6. allowed_commands (explicit allow list) → must match
+    ///   7. Dangerous argument patterns → deny
     pub fn isCommandAllowed(self: *const SecurityPolicy, command: []const u8) bool {
         if (self.autonomy == .read_only) return false;
+        if (command.len == 0) return false;
 
         // Reject oversized commands — never silently truncate
         if (command.len > MAX_ANALYSIS_LEN) return false;
+
+        // Always block catastrophic patterns regardless of autonomy level.
+        if (containsStr(command, ":(){:|:&};:")) return false;
+        if (containsStr(command, "rm -rf /") or containsStr(command, "rm -fr /")) return false;
+
+        // Extract base commands for allow/block checks.
+        var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
+        const norm_len = normalizeCommand(command, &normalized);
+        const norm = normalized[0..norm_len];
+
+        var has_cmd = false;
+        var iter = std.mem.splitScalar(u8, norm, 0);
+        while (iter.next()) |seg| {
+            const segment = std.mem.trim(u8, seg, " \t");
+            if (segment.len == 0) continue;
+
+            const cmd_part = skipEnvAssignments(segment);
+            var words = std.mem.tokenizeScalar(u8, cmd_part, ' ');
+            const first_word = words.next() orelse continue;
+            if (first_word.len == 0) continue;
+
+            const base_cmd = extractBasename(first_word);
+            if (base_cmd.len == 0) continue;
+
+            has_cmd = true;
+
+            // Blocked commands take priority — checked at every autonomy level.
+            for (self.blocked_commands) |blocked| {
+                if (std.mem.eql(u8, blocked, base_cmd)) return false;
+            }
+        }
+
+        if (!has_cmd) return false;
+
+        // Full autonomy: skip syntactic guards and allowlist.
+        if (self.autonomy == .full) return true;
+
+        // ── Supervised / default: syntactic guards ──────────────────────
 
         // Block subshell/expansion operators
         if (containsStr(command, "`") or containsStr(command, "$(") or containsStr(command, "${")) {
@@ -166,12 +215,12 @@ pub const SecurityPolicy = struct {
             return false;
         }
 
-        // Block Windows %VAR% environment variable expansion (cmd.exe attack surface)
+        // Block Windows %VAR% environment variable expansion
         if (comptime @import("builtin").os.tag == .windows) {
             if (hasPercentVar(command)) return false;
         }
 
-        // Block `tee` — can write to arbitrary files, bypassing redirect checks
+        // Block `tee` — can write to arbitrary files
         {
             var words_iter = std.mem.tokenizeAny(u8, command, " \t\n;|");
             while (words_iter.next()) |word| {
@@ -187,14 +236,11 @@ pub const SecurityPolicy = struct {
         // Block output redirections
         if (std.mem.indexOfScalar(u8, command, '>') != null) return false;
 
-        var normalized: [MAX_ANALYSIS_LEN]u8 = undefined;
-        const norm_len = normalizeCommand(command, &normalized);
-        const norm = normalized[0..norm_len];
+        // ── Supervised: allowlist check ─────────────────────────────────
 
-        var has_cmd = false;
-        var iter = std.mem.splitScalar(u8, norm, 0);
-        while (iter.next()) |raw_segment| {
-            const segment = std.mem.trim(u8, raw_segment, " \t");
+        var iter2 = std.mem.splitScalar(u8, norm, 0);
+        while (iter2.next()) |seg| {
+            const segment = std.mem.trim(u8, seg, " \t");
             if (segment.len == 0) continue;
 
             const cmd_part = skipEnvAssignments(segment);
@@ -204,8 +250,6 @@ pub const SecurityPolicy = struct {
 
             const base_cmd = extractBasename(first_word);
             if (base_cmd.len == 0) continue;
-
-            has_cmd = true;
 
             var found = false;
             for (self.allowed_commands) |allowed| {
@@ -220,7 +264,7 @@ pub const SecurityPolicy = struct {
             if (!isArgsSafe(base_cmd, cmd_part)) return false;
         }
 
-        return has_cmd;
+        return true;
     }
 
     /// Check if autonomy level permits any action at all

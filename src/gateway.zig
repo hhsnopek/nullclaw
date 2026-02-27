@@ -2189,6 +2189,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .workspace_dir = cfg.workspace_dir,
                 .workspace_only = cfg.autonomy.workspace_only,
                 .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+                .blocked_commands = cfg.autonomy.blocked_commands,
                 .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
                 .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
                 .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
@@ -2220,7 +2221,32 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
+                    .tools_config = cfg.tools,
                 }) catch &.{};
+
+                // Filter tools by enabled_tools whitelist (empty = all).
+                if (cfg.tools.enabled_tools.len > 0 and tools_slice.len > 0) {
+                    // In-place compaction on the mutable backing memory.
+                    const mut_slice = @constCast(tools_slice);
+                    var keep: usize = 0;
+                    for (mut_slice) |t| {
+                        const tname = t.name();
+                        var found = false;
+                        for (cfg.tools.enabled_tools) |allowed| {
+                            if (std.mem.eql(u8, tname, allowed)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) {
+                            mut_slice[keep] = t;
+                            keep += 1;
+                        } else {
+                            t.deinit(allocator);
+                        }
+                    }
+                    tools_slice = mut_slice[0..keep];
+                }
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);

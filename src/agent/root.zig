@@ -245,7 +245,7 @@ pub const Agent = struct {
     reasoning_mode: ReasoningMode = .off,
     usage_mode: UsageMode = .off,
     exec_host: ExecHost = .gateway,
-    exec_security: ExecSecurity = .allowlist,
+    exec_security: ExecSecurity = .full,
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
@@ -677,7 +677,8 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
             });
 
-            // Tools are sent via native JSON array only (no text-based tool instructions).
+            // Tools are sent via native JSON array in the provider request (both streaming
+            // and non-streaming). The SSE parser accumulates tool_call deltas from streaming.
             const full_system = system_prompt;
 
             // Keep exactly one canonical system prompt at history[0].
@@ -782,7 +783,7 @@ pub const Agent = struct {
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
-            const native_tools_enabled = !is_streaming and !self.suppress_tools and self.provider.supportsNativeTools();
+            const native_tools_enabled = !self.suppress_tools and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
@@ -796,7 +797,7 @@ pub const Agent = struct {
                         .model = self.model_name,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
-                        .tools = null,
+                        .tools = if (native_tools_enabled) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
@@ -818,7 +819,7 @@ pub const Agent = struct {
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
-                    .tool_calls = &.{},
+                    .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                 };

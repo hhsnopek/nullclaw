@@ -548,6 +548,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (aut.object.get("allowed_commands")) |v| {
                 if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
             }
+            if (aut.object.get("blocked_commands")) |v| {
+                if (v == .array) self.autonomy.blocked_commands = try parseStringArray(self.allocator, v.array);
+            }
             // forbidden_paths: ignored (removed — path security handled by path_security.zig)
             if (aut.object.get("allowed_paths")) |v| {
                 if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
@@ -738,6 +741,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("enabled_tools")) |v| {
+                if (v == .array) self.tools.enabled_tools = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {

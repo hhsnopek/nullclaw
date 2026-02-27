@@ -91,69 +91,8 @@ pub fn buildSystemPrompt(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
 
-    // Identity section — inject workspace MD files
+    // SOUL.md only — the 4B model breaks tool calling with any extra context.
     try buildIdentitySection(allocator, w, ctx.workspace_dir);
-
-    // Tools are handled via native JSON array in the provider request.
-    // No text-based tool listing in the system prompt.
-
-    // Attachment marker conventions for channel delivery.
-    try appendChannelAttachmentsSection(w);
-
-    // Conversation context section (Signal-specific for now)
-    if (ctx.conversation_context) |cc| {
-        try w.writeAll("## Conversation Context\n\n");
-        if (cc.channel) |ch| {
-            try std.fmt.format(w, "- Channel: {s}\n", .{ch});
-        }
-        if (cc.is_group) |ig| {
-            if (ig) {
-                if (cc.group_id) |gid| {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
-                    try std.fmt.format(w, "- Group ID: {s}\n", .{gid});
-                } else {
-                    try std.fmt.format(w, "- Chat type: group\n", .{});
-                }
-            } else {
-                try std.fmt.format(w, "- Chat type: direct message\n", .{});
-            }
-        }
-        if (cc.sender_number) |num| {
-            try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
-        }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
-        }
-        try w.writeAll("\n");
-    }
-
-    if (ctx.capabilities_section) |section| {
-        try w.writeAll(section);
-    }
-
-    // Safety section
-    try w.writeAll("## Safety\n\n");
-    try w.writeAll("- Do not exfiltrate private data.\n");
-    try w.writeAll("- Do not run destructive commands without asking.\n");
-    try w.writeAll("- Do not bypass oversight or approval mechanisms.\n");
-    try w.writeAll("- Prefer `trash` over `rm`.\n");
-    try w.writeAll("- When in doubt, ask before acting externally.\n\n");
-    try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
-
-    // Skills section
-    try appendSkillsSection(allocator, w, ctx.workspace_dir);
-
-    // Workspace section
-    try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
-
-    // DateTime section
-    try appendDateTimeSection(w);
-
-    // Runtime section
-    try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
-        @tagName(comptime std.Target.Os.Tag.macos),
-        ctx.model_name,
-    });
 
     return try buf.toOwnedSlice(allocator);
 }
@@ -163,34 +102,35 @@ fn buildIdentitySection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    try w.writeAll("## Project Context\n\n");
-    try w.writeAll("The following workspace files define your identity, behavior, and context.\n\n");
+    // Minimal prompt: SOUL.md only. Even small additions (user name, datetime)
+    // cause the 4B Qwen3 model to generate text instead of native tool calls.
+    try injectWorkspaceFileRaw(allocator, w, workspace_dir, "SOUL.md");
+}
 
-    const identity_files = [_][]const u8{
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-        "BOOTSTRAP.md",
-    };
-
-    for (identity_files) |filename| {
-        try injectWorkspaceFile(allocator, w, workspace_dir, filename);
-    }
-
-    // Inject MEMORY.md if present, otherwise fallback to memory.md.
-    try injectPreferredMemoryFile(allocator, w, workspace_dir);
+/// Inject a workspace file's raw content (no markdown header wrapping).
+fn injectWorkspaceFileRaw(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+    filename: []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+    defer allocator.free(path);
+    const content = std.fs.cwd().readFileAlloc(allocator, path, BOOTSTRAP_MAX_CHARS) catch return;
+    defer allocator.free(content);
+    const trimmed = std.mem.trim(u8, content, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+    try w.writeAll(trimmed);
+    try w.writeAll("\n\n");
 }
 
 fn buildToolsSection(w: anytype, tools: []const Tool) !void {
     try w.writeAll("## Tools\n\n");
+    try w.writeAll("To call a tool, output:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n\n");
     for (tools) |t| {
-        try std.fmt.format(w, "- **{s}**: {s}\n  Parameters: `{s}`\n", .{
+        try std.fmt.format(w, "- {s}: {s}\n", .{
             t.name(),
             t.description(),
-            t.parametersJson(),
         });
     }
     try w.writeAll("\n");

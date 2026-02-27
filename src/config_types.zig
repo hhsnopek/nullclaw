@@ -80,6 +80,7 @@ pub const AutonomyConfig = struct {
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
+    blocked_commands: []const []const u8 = &.{},
     /// Additional directories (absolute paths) the agent may access beyond workspace_dir.
     /// Resolved via realpath at check time; system-critical paths are always blocked.
     allowed_paths: []const []const u8 = &.{},
@@ -145,6 +146,8 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 50_000,
+    /// Whitelist of tool names to enable. Empty = all tools enabled.
+    enabled_tools: []const []const u8 = &.{},
 };
 
 pub const ModelRouteConfig = struct {

@@ -42,7 +42,6 @@ const allowed_exact_paths = [_][]const u8{
 
 const allowed_prefix_paths = [_][]const u8{
     "agent.",
-    "autonomy.",
     "browser.",
     "channels.",
     "diagnostics.",
@@ -51,9 +50,7 @@ const allowed_prefix_paths = [_][]const u8{
     "models.providers.",
     "runtime.",
     "scheduler.",
-    "security.",
     "session.",
-    "tools.",
 };
 
 pub fn freeMutationResult(allocator: std.mem.Allocator, result: *MutationResult) void {
