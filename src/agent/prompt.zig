@@ -39,6 +39,7 @@ pub fn workspacePromptFingerprint(
     const tracked_files = [_][]const u8{
         "AGENTS.md",
         "SOUL.md",
+        "SKILLS.md",
         "TOOLS.md",
         "IDENTITY.md",
         "USER.md",
@@ -102,9 +103,10 @@ fn buildIdentitySection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    // Minimal prompt: SOUL.md only. Even small additions (user name, datetime)
-    // cause the 4B Qwen3 model to generate text instead of native tool calls.
+    // Minimal prompt: SOUL.md + SKILLS.md only. Keep both files concise —
+    // the 4B Qwen3 model breaks tool calling with verbose context.
     try injectWorkspaceFileRaw(allocator, w, workspace_dir, "SOUL.md");
+    try injectWorkspaceFileRaw(allocator, w, workspace_dir, "SKILLS.md");
 }
 
 /// Inject a workspace file's raw content (no markdown header wrapping).
